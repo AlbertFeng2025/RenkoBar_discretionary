@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Renko Recorder Viewer</title>
+<style>
+  :root {
+    --bg: #f6f6f4; --panel: #ffffff; --ink: #1d1d1b; --muted: #6b6b66; --line: #e2e1dc;
+    --one: #137a3a; --zero: #b3b1aa; --accent: #c2410c; --accent-bg: #fff1e6; --money: #1d4ed8; --money-bg: #e8efff;
+    --warn: #92400e; --warn-bg: #fef3c7; --off: #9a9a94;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #151514; --panel: #1f1f1d; --ink: #ecebe6; --muted: #a3a29c; --line: #34332f;
+      --one: #4ade80; --zero: #57564f; --accent: #fb923c; --accent-bg: #3a2414; --money: #93b4ff; --money-bg: #1c2742;
+      --warn: #fcd34d; --warn-bg: #3a3014; --off: #77766f;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #151514; --panel: #1f1f1d; --ink: #ecebe6; --muted: #a3a29c; --line: #34332f;
+    --one: #4ade80; --zero: #57564f; --accent: #fb923c; --accent-bg: #3a2414; --money: #93b4ff; --money-bg: #1c2742;
+    --warn: #fcd34d; --warn-bg: #3a3014; --off: #77766f;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { position: sticky; top: 0; z-index: 2; background: var(--panel); border-bottom: 1px solid var(--line);
+           padding: 10px 16px; display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; }
+  h1 { font-size: 16px; margin: 0 8px 0 0; font-weight: 650; }
+  button { font: inherit; padding: 6px 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--ink); cursor: pointer; }
+  button.primary { background: var(--ink); color: var(--panel); border-color: var(--ink); }
+  label { color: var(--muted); display: inline-flex; gap: 6px; align-items: center; white-space: nowrap; }
+  #status { color: var(--muted); font-size: 13px; }
+  main { padding: 12px 16px 40px; max-width: 1600px; margin: 0 auto; }
+  .notice { background: var(--warn-bg); color: var(--warn); border-radius: 8px; padding: 10px 14px; margin: 10px 0; }
+  .rec { margin: 14px 0 22px; }
+  .rec-head { display: flex; flex-wrap: wrap; gap: 4px 16px; align-items: baseline; margin-bottom: 8px; }
+  .rec-head h2 { font-size: 15px; margin: 0; }
+  .rec-head span { color: var(--muted); font-size: 13px; }
+  .stale { color: var(--warn) !important; font-weight: 600; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; margin: 8px 0; }
+  .card.alarm { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent) inset; }
+  .card.off { color: var(--off); }
+  .title { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; font-weight: 600; }
+  .badge { font-size: 12px; font-weight: 600; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
+  .badge.money { color: var(--money); background: var(--money-bg); border-color: transparent; }
+  .badge.alarm { color: var(--accent); background: var(--accent-bg); border-color: transparent; font-size: 13px; }
+  .layer { margin-top: 8px; }
+  .stats { color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+  .stats b { color: var(--ink); font-weight: 600; }
+  .bits { font-family: Consolas, "Cascadia Mono", Menlo, monospace; font-size: var(--bitsize, 15px); line-height: 1.5;
+          word-break: break-all; margin-top: 2px; letter-spacing: 0.5px; }
+  .bits .o { color: var(--one); font-weight: 700; }
+  .bits .z { color: var(--zero); }
+  .bits .g { margin-right: 0.45em; }
+  .empty { color: var(--muted); font-style: italic; }
+  .deep { border-left: 3px solid var(--ink); padding-left: 8px; }
+  .run b { color: var(--accent); }
+  footer { color: var(--muted); font-size: 12px; text-align: center; padding: 16px; }
+  @media (max-width: 640px) { header { padding: 10px 12px; } main { padding: 10px 12px 40px; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Renko Recorder Viewer</h1>
+  <button id="pick" class="primary">Choose log folder (e.g. C:\temp)</button>
+  <button id="reconnect" hidden>Reconnect to last folder</button>
+  <label><input type="checkbox" id="hideOff" checked> hide OFF setups</label>
+  <label><input type="checkbox" id="beep"> beep in browser on new alert</label>
+  <label>text size <button id="smaller" title="smaller">−</button><button id="bigger" title="bigger">+</button></label>
+  <label><input type="checkbox" id="group" checked> groups of 10</label>
+  <span id="status">No folder chosen yet.</span>
+</header>
+<main id="main">
+  <div class="notice" id="intro">
+    Click <b>Choose log folder</b> and pick the folder set as "Log Folder" in Indicator_Renko_MultiRecorder (default <code>C:\temp</code>).
+    The page then re-reads every <code>*_state.json</code> in that folder every 1.5 seconds — no need to refresh.
+    It only <i>reads</i> the files; NinjaTrader keeps writing whether this page is open or not.
+    Use Chrome or Edge (Firefox cannot open folders).
+  </div>
+</main>
+<footer>Reads <code>&lt;LogBaseName&gt;_state.json</code> written after every brick. Strings shown in full; the line with a dark left edge is the deepest (money) layer.
+"0s in a row" = how many 0's follow the last 1 of that string.</footer>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const POLL_MS = 1500, STALE_S = 180;
+  let dir = null, timer = null, lastText = {}, lastAlertCounts = {}, states = {};
+  let bitSize = 15;
+  try { bitSize = +localStorage.getItem('rv_bits') || 15; } catch (e) {}
+  try { $('hideOff').checked = localStorage.getItem('rv_hide') !== '0'; $('beep').checked = localStorage.getItem('rv_beep') === '1';
+        $('group').checked = localStorage.getItem('rv_group') !== '0'; } catch (e) {}
+  document.documentElement.style.setProperty('--bitsize', bitSize + 'px');
+
+  // ---- remember the folder handle (IndexedDB) ----
+  function idb() { return new Promise((ok, no) => { const r = indexedDB.open('renko_viewer', 1);
+    r.onupgradeneeded = () => r.result.createObjectStore('h'); r.onsuccess = () => ok(r.result); r.onerror = () => no(r.error); }); }
+  async function saveHandle(h) { try { const db = await idb(); db.transaction('h', 'readwrite').objectStore('h').put(h, 'dir'); } catch (e) {} }
+  async function loadHandle() { try { const db = await idb(); return await new Promise(ok => {
+    const q = db.transaction('h').objectStore('h').get('dir'); q.onsuccess = () => ok(q.result || null); q.onerror = () => ok(null); }); } catch (e) { return null; } }
+
+  async function start(h) {
+    dir = h; $('intro').hidden = true; $('reconnect').hidden = true;
+    setStatus('Reading folder "' + h.name + '" …');
+    if (timer) clearInterval(timer);
+    await poll(); timer = setInterval(poll, POLL_MS);
+  }
+
+  $('pick').onclick = async () => {
+    if (!window.showDirectoryPicker) { setStatus('This browser cannot open folders. Please use Chrome or Edge.'); return; }
+    try { const h = await window.showDirectoryPicker({ id: 'renko-logs', mode: 'read' }); await saveHandle(h); start(h); }
+    catch (e) { if (e.name !== 'AbortError') setStatus('Could not open the folder: ' + e.message); }
+  };
+  $('reconnect').onclick = async () => {
+    const h = await loadHandle(); if (!h) return;
+    try { if ((await h.requestPermission({ mode: 'read' })) === 'granted') start(h); else setStatus('Permission not given.'); }
+    catch (e) { setStatus('Please choose the folder again.'); }
+  };
+  (async () => { const h = await loadHandle(); if (h && !new URLSearchParams(location.search).has('demo')) {
+      $('reconnect').hidden = false; $('reconnect').textContent = 'Reconnect to "' + h.name + '"'; } })();
+
+  $('hideOff').onchange = () => { try { localStorage.setItem('rv_hide', $('hideOff').checked ? '1' : '0'); } catch (e) {} render(); };
+  $('beep').onchange = () => { try { localStorage.setItem('rv_beep', $('beep').checked ? '1' : '0'); } catch (e) {} if ($('beep').checked) beep(); };
+  $('group').onchange = () => { try { localStorage.setItem('rv_group', $('group').checked ? '1' : '0'); } catch (e) {} render(); };
+  $('smaller').onclick = () => size(-1); $('bigger').onclick = () => size(1);
+  function size(d) { bitSize = Math.max(9, Math.min(28, bitSize + d)); document.documentElement.style.setProperty('--bitsize', bitSize + 'px');
+    try { localStorage.setItem('rv_bits', bitSize); } catch (e) {} }
+
+  function setStatus(t) { $('status').textContent = t; }
+
+  async function poll() {
+    if (!dir) return;
+    try {
+      const seen = {};
+      for await (const [name, entry] of dir.entries()) {
+        if (entry.kind !== 'file' || !name.endsWith('_state.json')) continue;
+        seen[name] = true;
+        const f = await entry.getFile();
+        const key = name + ':' + f.lastModified + ':' + f.size;
+        if (lastText[name] === key) continue;
+        let txt;
+        try { txt = await f.text(); } catch (e) { continue; }            // being rewritten: try next poll
+        try { states[name] = JSON.parse(txt); lastText[name] = key; } catch (e) { /* half-written: next poll */ }
+      }
+      for (const n of Object.keys(states)) if (!seen[n]) delete states[n];
+      checkAlerts(); render();
+      setStatus('Folder "' + dir.name + '" · ' + Object.keys(states).length + ' recorder(s) · checked ' + new Date().toLocaleTimeString());
+    } catch (e) { setStatus('Lost access to the folder (' + e.message + '). Click Reconnect.'); clearInterval(timer); $('reconnect').hidden = false; }
+  }
+
+  function checkAlerts() {
+    let fresh = false;
+    for (const [file, st] of Object.entries(states))
+      for (const s of st.setups || []) {
+        const k = file + '#' + s.n, c = s.alert_count || 0;
+        if (k in lastAlertCounts && c > lastAlertCounts[k]) fresh = true;
+        lastAlertCounts[k] = c;
+      }
+    if (fresh && $('beep').checked) beep();
+  }
+
+  let actx = null;
+  function beep() {
+    try { actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+      const o = actx.createOscillator(), g = actx.createGain(); o.frequency.value = 880; o.connect(g); g.connect(actx.destination);
+      g.gain.setValueAtTime(0.0001, actx.currentTime); g.gain.exponentialRampToValueAtTime(0.25, actx.currentTime + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, actx.currentTime + 0.45); o.start(); o.stop(actx.currentTime + 0.5); } catch (e) {}
+  }
+
+  const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  function bitsHtml(s) {
+    if (!s) return '<span class="empty">none yet</span>';
+    const grp = $('group').checked; let out = '';
+    for (let i = 0; i < s.length; i++) {
+      const cls = s[i] === '1' ? 'o' : 'z';
+      const gap = grp && (s.length - i - 1) % 10 === 0 && i < s.length - 1;   // groups counted from the newest bit
+      out += '<span class="' + cls + (gap ? ' g' : '') + '">' + s[i] + '</span>';
+    }
+    return out;
+  }
+  // 0's after the last 1 of a string (all 0's -> its length); uses the recorder's value when present
+  function trail0(l) { if (typeof l.trail0 === 'number') return l.trail0; const s = l.s || ''; const k = s.lastIndexOf('1'); return s.length - k - 1; }
+  function ago(ts) { if (!ts) return null; const t = new Date(ts.replace(' ', 'T')); return isNaN(t) ? null : (Date.now() - t) / 1000; }
+  function hm(ts) { return ts ? ts.slice(11, 19) : ''; }
+
+  function render() {
+    const main = $('main'); const files = Object.keys(states).sort();
+    if (!files.length) { if (dir) main.innerHTML = '<div class="notice">No <code>*_state.json</code> found in this folder yet. Is Indicator_Renko_MultiRecorder running with "Enable logs" ON and this Log Folder?</div>'; return; }
+    let html = '';
+    for (const f of files) {
+      const st = states[f]; const age = ago(st.written);
+      html += '<section class="rec"><div class="rec-head"><h2>' + esc(st.recorder) + '</h2>'
+        + '<span>' + esc(st.instrument) + ' · ' + esc(st.brick) + '</span>'
+        + '<span>last brick ' + esc(hm(st.last_brick)) + '</span>'
+        + '<span' + (age !== null && age > STALE_S ? ' class="stale"' : '') + '>file written ' + esc(hm(st.written))
+        + (age !== null && age > STALE_S ? ' (' + Math.round(age / 60) + ' min ago — slow market or NinjaTrader stopped?)' : '') + '</span>'
+        + '<span>' + esc(st.history) + (st.reset_on_new_session ? '' : ' · strings continue across sessions') + '</span></div>';
+      for (const s of st.setups || []) {
+        if (!s.on && $('hideOff').checked && !s.problem) continue;
+        const title = 'S' + String(s.n).padStart(2, '0') + ' ' + s.book + '  F1=' + s.f1 + (s.f2 ? '  F2=' + s.f2 : '') + (s.f3 ? '  F3=' + s.f3 : '');
+        if (!s.on) { html += '<div class="card off"><div class="title">' + esc(title || ('S' + s.n)) + ' <span class="badge">OFF</span></div>'
+          + (s.problem ? '<div class="stats">' + esc(s.problem) + '</div>' : '') + '</div>'; continue; }
+        html += '<div class="card' + (s.alarm_now ? ' alarm' : '') + '"><div class="title">' + esc(title)
+          + '<span class="badge">Layer ' + s.layer + '</span>'
+          + (s.alert ? '<span class="badge">alert ' + esc(s.alert) + '</span>' : '')
+          + (s.money_next ? '<span class="badge money">MONEY NEXT</span>' : '')
+          + (s.alarm_now ? '<span class="badge alarm">ALARMING NOW ' + esc(hm(s.last_alert)) + '</span>'
+             : s.last_alert ? '<span class="badge">last alert ' + esc(hm(s.last_alert)) + '</span>' : '')
+          + (s.problem ? '<span class="badge">' + esc(s.problem) + '</span>' : '') + '</div>';
+        const n = (s.lines || []).length;
+        (s.lines || []).forEach((l, i) => {
+          const label = l.name + (i === n - 1 && n > 1 ? ' = money' : '');
+          html += '<div class="layer' + (i === n - 1 ? ' deep' : '') + '"><div class="stats"><b>' + esc(label) + '</b> (' + esc(l.pattern) + ')  '
+            + 'bits <b>' + l.bits + '</b>'
+            + (l.pct !== '' ? ' · 1s ' + l.ones + ' = <b>' + esc(l.pct) + '%</b>' : '')
+            + (l.roll !== '' ? ' · last ' + Math.min(st.rolling, l.bits) + ': <b>' + esc(l.roll) + '%</b>' : '')
+            + (i === n - 1 && l.bits > 0 ? ' · <span class="run">0s in a row: <b>' + trail0(l) + '</b></span>' : '')
+            + '</div><div class="bits">' + bitsHtml(l.s) + '</div></div>';
+        });
+        html += '</div>';
+      }
+      html += '</section>';
+    }
+    main.innerHTML = html;
+  }
+
+  // ---- demo mode (open the file with ?demo to see sample data) ----
+  if (new URLSearchParams(location.search).has('demo')) {
+    const r = (n, p) => Array.from({ length: n }, () => Math.random() < p ? '1' : '0').join('');
+    const L = (name, pattern, s) => ({ name, pattern, bits: s.length, ones: [...s].filter(c => c === '1').length,
+      pct: s ? (100 * [...s].filter(c => c === '1').length / s.length).toFixed(1) : '', roll: s ? (100 * [...s.slice(-20)].filter(c => c === '1').length / Math.min(20, s.length)).toFixed(1) : '', s });
+    const now = new Date(), ts = d => d.toISOString().slice(0, 19).replace('T', ' ');
+    const f1a = r(312, 0.35), f1b = r(150, 0.34), f2b = r(46, 0.4) + '1000';
+    states['Renko_MultiRecorder_state.json'] = { recorder: 'Renko_MultiRecorder', written: ts(now), instrument: 'MNQ 12-26', brick: 'Renko 40',
+      last_brick: ts(now), since: '', history: 'back fill 640 bricks from 10-27 06:30:02; stopped: session start reached', rolling: 20, reset_on_new_session: true,
+      setups: [
+        { n: 1, book: 'MERGED', on: true, problem: '', f1: '10', f2: '01,10', f3: '', alert: '1000', layer: 2, money_next: false, alarm_now: false, last_alert: ts(new Date(now - 6e5)), alert_count: 3, lines: [L('F1', '10', f1a), L('F2', '01,10', r(120, 0.35) + '10000')] },
+        { n: 2, book: 'MERGED', on: true, problem: '', f1: '100', f2: '01,10', f3: '', alert: '1000', layer: 2, money_next: true, alarm_now: true, last_alert: ts(now), alert_count: 1, lines: [L('F1', '100', f1b), L('F2', '01,10', f2b)] },
+        { n: 3, book: 'LONG', on: true, problem: '', f1: '10', f2: '', f3: '', alert: '1000', layer: 1, money_next: false, alarm_now: false, last_alert: '', alert_count: 0, lines: [L('F1', '10', r(160, 0.35))] },
+        { n: 5, book: 'SHORT', on: true, problem: '', f1: '100', f2: '10?', f3: '00', alert: '1000', layer: 3, money_next: false, alarm_now: false, last_alert: '', alert_count: 0, lines: [L('F1', '100', r(80, 0.34)), L('F2', '10?', r(20, 0.4)), L('F3', '00', r(6, 0.4))] },
+        { n: 10, book: 'MERGED', on: false, problem: "F1 '1O' has an invalid character 'O' (only 0 1 * ? and commas) -> setup OFF", f1: '1O', f2: '', f3: '', alert: '1000', layer: 0, money_next: false, alarm_now: false, last_alert: '', alert_count: 0, lines: [] }
+      ] };
+    $('intro').hidden = true; setStatus('DEMO data (open without ?demo for your real folder)'); render();
+  }
+})();
+</script>
+</body>
+</html>
