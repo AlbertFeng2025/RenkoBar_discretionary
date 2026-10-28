@@ -1,0 +1,1315 @@
+#region Using declarations
+using System;
+using System.IO;
+using System.Text;
+using System.ComponentModel;
+using System.ComponentModel.DataAnnotations;
+using NinjaTrader.Cbi;
+using NinjaTrader.Data;
+using NinjaTrader.NinjaScript;
+using NinjaTrader.NinjaScript.Strategies;
+#endregion
+
+// 2026-10-28  Parameter DISPLAY ORDER unified across all 9 transit files (merged/LONG/SHORT x L1/L2/L3):
+//             1 Filter & Order, 2 Quantity, 3 Limits & Exit, 4 Entry & Bracket, 5 Hours, 6 Session,
+//             7 Gates, 8 Logging, 9 Margin. Only [Display] GroupName/Order changed - NO logic change.
+// 2026-10-28  F3 blank -> Layer-2 behaviour (F3 gate open), same as LONG/SHORT Layer-3. Defaults F2=01,10 F3=1000.
+// =============================================================================
+// Renko_mergedTransit_layer3  —  DUAL-DIRECTION merged Renko, THREE layers
+// =============================================================================
+// One instance trades BOTH long and short off a MERGED brick stream.
+//
+// THREE-LAYER PIPELINE (each string is the win/loss of the layer below it):
+//   brick colors (rawString)                     green=1 / red=0
+//     -> F1 shape picks direction + entry        (green-red=LONG, red-green=SHORT)
+//   filter1Outcome = win/loss of each F1 trade   (1 = that book's trade won)
+//     -> F2 shape on filter1Outcome  => isArmed
+//   filter2Outcome = win/loss of each ARMED (L2) would-be trade
+//     -> F3 shape on filter2Outcome  => isArmed3
+//   REAL order fires only when: F1 signal AND isArmed(F2) AND isArmed3(F3).
+//
+//   MAPPING to the fixed single-book strategy: merged filter1Outcome is the SAME
+//   thing as the fixed strategy's rawString (both are trade win/loss). So fixed-F1
+//   -> merged-F2, and fixed-F2 -> merged-F3. Merged spends F1 turning colors into
+//   trades; the fixed book gets that free by fixing direction.
+//
+//   WARM-UP / SESSION TEMPLATE:  filter2Outcome (=> F3) needs several L2 would-be
+//   trades to accumulate before it can arm. The SEED BACK-FILL (below) now does that
+//   warm-up from the chart's history of the CURRENT SESSION at enable time. Use an
+//   ETH (24h Globex) template so the session (and the back-fill) reaches back to the
+//   18:00 ET open; an RTH template starts the session at 09:30 -> little/no history.
+//
+//   Bit convention (MERGED / LONG-string):  Close rose = GREEN = 1
+//                                            Close fell = RED   = 0
+//   shortString = bitwise flip of longString.
+//
+//   DIRECTION = the book that matched. "Chase the transit":
+//     long-string "10" (green->red) -> bet next green -> LONG
+//     short-string "10" (= real red->green) -> bet next red -> SHORT
+//
+//   Bracket geometry flips per trade, anchored to the BRICK CLOSE (Close[0]):
+//     LONG : stop = brickClose - StopLossPoints (below), target = brickClose + ProfitTargetPoints (above)
+//     SHORT: stop = brickClose + StopLossPoints (above), target = brickClose - ProfitTargetPoints (below)
+//
+//   ONE account, SERIALIZED: a new signal is skipped while a position/order is
+//   open. Qty rule / exit-bit / breaker all read the MERGED realTradeOutcome.
+//
+// CHANGES 2026-10-10
+//   (1) SEED BACK-FILL: on enable, replays up to SeedBrickCount already-closed
+//       bricks of the CURRENT SESSION (stops at the session start) through the
+//       same pipeline as live bricks -> color strings, filter1Outcome, F2 arm,
+//       filter2Outcome and F3 arm are rebuilt "as if the strategy had been running".
+//       If fully armed after the replay, the next qualifying live F1 brick trades.
+//       Replay NEVER places orders and does not count toward MaxTotalBarCount.
+//   (2) Entry-fill re-drive of DoFlatten during shutdown (was only in Layer 1).
+//   (3) SHUTDOWN HEARTBEAT: while a shutdown is in progress, a 1-second timer
+//       re-drives DoFlatten until flat + order-free.
+// =============================================================================
+namespace NinjaTrader.NinjaScript.Strategies
+{
+    public class Renko_mergedTransit_layer3 : Strategy
+    {
+        // ── merged pipeline strings (LONG encoding: green=1/red=0) ────────────
+        private readonly StringBuilder longStr        = new StringBuilder();
+        private readonly StringBuilder shortStr       = new StringBuilder();
+        private readonly StringBuilder filter1Outcome = new StringBuilder(); // merged, win-encoded (feeds F2)
+        private readonly StringBuilder realTradeOutcome = new StringBuilder(); // merged real W/L
+        private readonly StringBuilder filter2Outcome = new StringBuilder(); // L3: win/loss of ARMED (L2) would-be trades
+
+        // ── pipeline / order state ────────────────────────────────────────────
+        private int    prevBarBit    = -1;     // 1=green, 0=red
+        private int    barCount      = 0;
+        private bool   entryInFlight = false;
+        private bool   awaitingClose = false;
+        private double entryFillPrice = 0.0;
+        private int    entryFillQty   = 0;
+        private int    tradeSide      = 0;      // +1 long, -1 short, 0 flat (side of the working money trade)
+        private const string ENTRY_LONG  = "ML3_Long";
+        private const string ENTRY_SHORT = "ML3_Short";
+
+        // waiting-for-outcome (observation string, per book)
+        private bool waitLongOutcome  = false;
+        private bool waitShortOutcome = false;
+        private bool isArmed          = false;   // Layer-2: F2 matched on merged outcome
+        private bool waitLongOutcome2  = false;  // Layer-3: awaiting outcome of an armed LONG would-be trade
+        private bool waitShortOutcome2 = false;  // Layer-3: awaiting outcome of an armed SHORT would-be trade
+        private bool isArmed3          = false;  // Layer-3: F3 matched on filter2Outcome
+        private bool loggedSessionTemplate = false;
+
+        // ── loss streak / qty ─────────────────────────────────────────────────
+        private int realLossesInARow = 0;
+        private (string pattern, int multiplier)[] qtyTable =
+            new (string pattern, int multiplier)[] { ("00", 2), ("000", 3), ("0000", 5) };
+        private int currentQty = 1;
+        private readonly StringBuilder sessionRealOutcome = new StringBuilder();
+
+        // ── life / shutdown ───────────────────────────────────────────────────
+        private DateTime strategyStartUtc = DateTime.MinValue;
+        private bool     lifeStarted      = false;
+        private bool     pendingFlatten   = false;
+        private string   pendingReason    = string.Empty;
+        private bool     flattenSubmitted = false;              // shutdown: market flatten sent once
+        private DateTime flattenStartUtc  = DateTime.MinValue;  // watchdog start
+        private bool     flattenWarned    = false;              // watchdog warned once
+        private const int FlattenTimeoutSeconds = 20;           // warn if we can't confirm clean
+        private int      flattenAttempts  = 0;                  // bounded: how many flatten orders we've fired
+        private DateTime lastFlattenUtc   = DateTime.MinValue;  // throttle: no more than one flatten/second
+        private bool     flattenGaveUp    = false;              // stop firing after MaxFlattenAttempts
+        private bool     inDoFlatten      = false;              // re-entrancy guard (order submit can call back synchronously)
+        private const int MaxFlattenAttempts = 8;               // hard cap so we can NEVER spam orders
+        private System.Timers.Timer flattenTimer = null;        // shutdown heartbeat: re-drives DoFlatten ~1/sec until clean
+        private int      winQtyThisTrade  = 0;                  // contracts this trade closed on Profit target
+        private int      lossQtyThisTrade = 0;                  // contracts this trade closed on Stop loss (or unknown)
+        private DateTime entryFillUtc     = DateTime.MinValue;  // when the current entry last filled
+        private bool     openModifyRejectLogged = false;        // throttle the open-modify-reject note
+        private const int NakedGraceSeconds = 3;                // grace before the naked-position guard fires
+        private DateTime nakedFirstSeenUtc = DateTime.MinValue;  // first moment we saw "open + no live stop" (needs 2nd look)
+        private const int NakedConfirmSeconds = 2;               // must STILL be open+unprotected this long before flattening
+
+        // ── logging / gap ─────────────────────────────────────────────────────
+        private string  activeLogFilePath = null;
+        private bool    seedPending      = false;   // back-fill history once after a clean enable (on the first live brick)
+        private bool    firstBrickDone   = false;
+        private int     lastProcessedBar = -1;      // brick-contiguity (hole) detection
+        private bool    marginActive     = false;   // inside the margin-cutoff flat window
+        private bool    marginLogged     = false;   // one-shot 'window active' log
+
+        // ── parsed F1 list ────────────────────────────────────────────────────
+        private System.Collections.Generic.List<string> filter1Patterns =
+            new System.Collections.Generic.List<string>();
+        // parsed F2 list (multi-pattern OR on the merged outcome string)
+        private System.Collections.Generic.List<string> filter2Patterns =
+            new System.Collections.Generic.List<string>();
+        // parsed F3 list (multi-pattern OR on the ARMED-trade outcome string)
+        private System.Collections.Generic.List<string> filter3Patterns =
+            new System.Collections.Generic.List<string>();
+
+        protected override void OnStateChange()
+        {
+            if (State == State.SetDefaults)
+            {
+                Name        = "Renko_mergedTransit_layer3";
+                Description = "Dual-direction MERGED Renko Layer-3. green=1/red=0. F1 picks direction; F2 arms on the "
+                            + "F1-trade win/loss string (filter1Outcome); F3 arms on the ARMED-trade win/loss string "
+                            + "(filter2Outcome). Real order needs F1 signal AND F2-armed AND F3-armed. Seed back-fill "
+                            + "warms all layers from the current session's history at enable (use an ETH template).";
+
+                Calculate                    = Calculate.OnBarClose;
+                EntriesPerDirection          = 1;
+                EntryHandling                = EntryHandling.AllEntries;
+                IsExitOnSessionCloseStrategy = true;
+                ExitOnSessionCloseSeconds    = 30;
+                MaximumBarsLookBack          = MaximumBarsLookBack.Infinite;   // seed back-fill may read far back
+                StartBehavior                = StartBehavior.WaitUntilFlat;
+                TimeInForce                  = TimeInForce.Gtc;
+                RealtimeErrorHandling        = RealtimeErrorHandling.StopCancelCloseIgnoreRejects;
+                StopTargetHandling           = StopTargetHandling.PerEntryExecution;
+                BarsRequiredToTrade          = 0;
+                IsUnmanaged                  = false;
+
+                EnableTradingHours   = true;
+                TradingStartHour     = 9;
+                TradingStartMinute   = 30;
+                TradingEndHour       = 11;
+                TradingEndMinute     = 30;
+                StrategyLifeMinutes  = 1440;
+                UseMarketEntry       = true;
+                LimitOffsetPoints    = 5;
+                StopLossPoints       = 10;      // 40-tick brick default
+                ProfitTargetPoints   = 20;
+                EnableRealOrder      = false;   // observation only until flipped
+                Filter1Pattern       = "10";
+                Filter2Pattern       = "01,10";
+                Filter3Pattern       = "1000";
+                BaseQuantity         = 1;
+                EnableQtyIncrement   = false;
+                QtyRuleText          = "(\"00\":2),(\"000\":3),(\"0000\":5)";
+                EnableTradeOutcomeExit  = true; // exit-bit on by default per design
+                TradeOutcomeExitPattern = "1";  // win-and-quit
+                MaxTotalBarCount     = 100000;
+                MaxRealLossInARow    = 5;
+                LogFolder            = @"C:\temp";
+                LogBaseName          = "Renko_mergedTransit_layer3";
+                SeedPendingBarOnStart = true;
+                SeedBrickCount        = 1000;   // back-fill up to 1000 closed bricks (current session only)
+                RestartOnNewSession   = true;
+                EnableMarginCutoff    = true;   // early EOD before broker overnight-margin snapshot
+                MarginCutoffHour      = 16;     // 16:35 NY cutoff -> flatten 16:30 NY (15 min before the 16:45 NY snapshot)
+                MarginCutoffMinute    = 35;
+                MarginCutoffLeadMin   = 5;      // flatten 5 min before -> 16:30 NY
+            }
+            else if (State == State.Configure)
+            {
+                // LIMIT ENTRY DISABLED (2026-10-21): the limit option has a known bug (an unfilled limit is
+                // never cancelled, and a late fill keeps the stale stop/target). The setting is hidden in the
+                // UI and FORCED to market here, so an old saved template/workspace with limit=on can't use it.
+                if (!UseMarketEntry)
+                    Print(Name + ": limit entry is disabled in this version -> forcing MARKET entry.");
+                UseMarketEntry = true;
+
+                // 1-minute clock series: reliable heartbeat so the margin cutoff fires on time
+                // even when Renko bricks are sparse (thin post-RTH tape).
+                AddDataSeries(BarsPeriodType.Minute, 1);
+            }
+            else if (State == State.Realtime)
+            {
+                if (!lifeStarted)
+                {
+                    strategyStartUtc = DateTime.UtcNow;
+                    lifeStarted      = true;
+                    ParseFilter1Patterns();
+                    ParseFilter2Patterns();
+                    ParseFilter3Patterns();
+                    ParseQtyRule();
+                    FreshStart("strategy enabled (fresh start)", SeedPendingBarOnStart);
+                }
+            }
+            else if (State == State.Terminated)
+            {
+                StopFlattenTimer();   // never leave the shutdown heartbeat running
+            }
+        }
+
+        // =====================================================================
+        // OnBarUpdate — brick close -> bit -> merged pipeline -> maybe trade(s)
+        // =====================================================================
+        protected override void OnBarUpdate()
+        {
+            if (State != State.Realtime) return;
+            if (BarsInProgress == 1) { CheckMarginCutoff(); return; }   // 1-min clock series
+            if (BarsInProgress != 0) return;                            // ignore any other series
+            if (CurrentBar < 1) return;
+
+            if (pendingFlatten) { DoFlatten(); return; }
+            // margin-cutoff backup: also flatten on a brick close inside the window
+            // (guaranteed-correct order context; the 1-min series covers quiet tape).
+            if (marginActive && Position.MarketPosition != MarketPosition.Flat) { MarginFlatten(); return; }
+
+            // NAKED-POSITION GUARD: if we hold a position with NO live stop protecting it, it is
+            // unprotected -> flatten + disable THIS instance. Covers NinjaTrader dropping a stop it
+            // could not re-size, or an over-fill that flipped us into a bare position. The grace
+            // window (from the entry fill) prevents misfires during the normal entry->bracket
+            // handshake. Only this instance is affected; other strategies are untouched.
+            // TWO-LOOK CONFIRMATION. A stop that JUST FILLED also makes HasLiveStop() false for an
+            // instant while the position still reads open -- that is a NORMAL stop-out closing us,
+            // NOT a naked position. Firing there would flatten a position the stop already closed and
+            // could FLIP us. So on the FIRST sight of "open + no live stop" we only STAMP the time and
+            // wait; we flatten only if it is STILL open + unprotected NakedConfirmSeconds later. A
+            // filling stop will have gone flat by then -> we clear the stamp and do nothing (the loss
+            // is recorded normally and, under MaxLossRow, trading continues). A genuinely dropped stop
+            // stays open + bare across both looks -> we flatten.
+            bool openAndUnprotected =
+                Position.MarketPosition != MarketPosition.Flat && !entryInFlight && !pendingFlatten
+                && entryFillUtc != DateTime.MinValue
+                && (DateTime.UtcNow - entryFillUtc).TotalSeconds > NakedGraceSeconds
+                && !HasLiveStop();
+
+            if (!openAndUnprotected)
+            {
+                nakedFirstSeenUtc = DateTime.MinValue;   // flat or protected again -> reset the confirmation
+            }
+            else
+            {
+                if (nakedFirstSeenUtc == DateTime.MinValue)
+                {
+                    nakedFirstSeenUtc = DateTime.UtcNow;  // FIRST look: wait, don't act (may be a filling stop)
+                    DiagLog("[NAKED GUARD] saw open + no live stop -> waiting " + NakedConfirmSeconds
+                        + "s to confirm (a just-filled stop looks the same; will clear itself if it was one).");
+                }
+                else if ((DateTime.UtcNow - nakedFirstSeenUtc).TotalSeconds >= NakedConfirmSeconds)
+                {
+                    DiagLog("[NAKED GUARD] STILL open + no live stop after " + NakedConfirmSeconds
+                        + "s -> genuinely unprotected -> flatten + disable this instance.");
+                    nakedFirstSeenUtc = DateTime.MinValue;
+                    BeginShutdown("naked position (no live stop)");
+                    return;
+                }
+            }
+
+            // ── NEW SESSION: clean roll (reset qty/breaker; optionally fresh log + empty pipeline) ──
+            if (firstBrickDone && Bars.IsFirstBarOfSession)
+            {
+                sessionRealOutcome.Clear();
+                realLossesInARow = 0;
+                if (RestartOnNewSession)
+                    FreshStart("new trading session", false);   // no seed: do NOT carry prior day across
+            }
+            // ── HOLE: bricks were skipped (a disconnect that MISSED bricks) -> clean restart, NO seed ──
+            else if (lastProcessedBar >= 0 && CurrentBar > lastProcessedBar + 1)
+            {
+                FreshStart("brick gap: CurrentBar " + lastProcessedBar + " -> " + CurrentBar
+                    + " (missed " + (CurrentBar - lastProcessedBar - 1) + " brick(s))", false);
+            }
+            // (a short blip that missed NO bricks advances CurrentBar by exactly 1 -> we just continue)
+            lastProcessedBar = CurrentBar;
+            firstBrickDone   = true;
+
+            if (!loggedSessionTemplate)
+            {
+                loggedSessionTemplate = true;
+                string thName = "(unknown)";
+                try { if (Bars != null && Bars.TradingHours != null) thName = Bars.TradingHours.Name; } catch {}
+                DiagLog("[SESSION TEMPLATE] " + thName + " | RestartOnNewSession=" + RestartOnNewSession
+                    + " -- the seed back-fill reaches back only to this template's session start. For 09:30 RTH "
+                    + "trading with a full overnight warm-up, use an ETH (24h) template.");
+            }
+
+            // ── SEED BACK-FILL (one time, after a clean enable): replay the already-closed bricks of
+            //    the CURRENT SESSION (up to SeedBrickCount) through the same pipeline, so all strings and
+            //    the F2/F3 armed states are warm before this first live brick. NEVER places an order. ──
+            if (seedPending)
+            {
+                seedPending = false;
+                ReplaySeedBricks();
+            }
+
+            // ── life / bar-count / breaker shutdown checks ───────────────────
+            if (StrategyLifeMinutes > 0 && (DateTime.UtcNow - strategyStartUtc).TotalMinutes >= StrategyLifeMinutes)
+            { BeginShutdown("strategy life reached"); return; }
+            if (barCount >= MaxTotalBarCount) { BeginShutdown("MaxTotalBarCount reached"); return; }
+            if (realLossesInARow >= MaxRealLossInARow) { BeginShutdown("MaxRealLossInARow reached"); return; }
+
+            // ── derive the brick bit (green=1 / red=0) from close-vs-close ────
+            int bit = BitFor(Close[0], Close[1]);
+            barCount++;
+
+            // ── pipeline: collect L1/L2 outcomes (updates F2/F3 arms), append bit, test F1, arm observation ──
+            bool longMatch, shortMatch;
+            ProcessBrick(bit, true, out longMatch, out shortMatch);
+
+            DiagLog(string.Format("[BRICK #{0}] Close={1:F2} Prev={2:F2} bit={3}({4}) | longTail={5} shortTail={6}",
+                barCount, Close[0], Close[1], bit, bit == 1 ? "GREEN/up" : "RED/down",
+                TailOf(longStr, 12), TailOf(shortStr, 12)));
+
+            // outcome bit-strings (win=1/loss=0, next-brick "would-trade" proxy) for eyeballing.
+            // f1out = every F1 transit; f2out = F2-armed transits only (sparser subsequence).
+            DiagLog(string.Format("[OUT   #{0}] f1out={1} f2out={2}",
+                barCount, ("(" + filter1Outcome.Length + ") " + filter1Outcome.ToString()), ("(" + filter2Outcome.Length + ") " + filter2Outcome.ToString())));
+
+            // ── fire (serialized): LONG first, then SHORT if still free ───────
+            bool busy = hasOpenPosition() || entryInFlight || awaitingClose;
+
+            // ── dirty-book guard: flat & idle but a stray order is still live (e.g. a
+            //    reduce-to-zero leftover). Cancel it and SKIP entry this brick so a new
+            //    trade never stacks on an orphan; the book is clean by the next brick.
+            //    Only this strategy's own orders; never runs during a trade or shutdown.
+            if (!busy && !pendingFlatten && HasLiveOrders())
+            {
+                DiagLog("[RECONCILE] flat & idle but stray order(s) live -> canceling, skipping entry this brick.");
+                CancelMyLiveOrders();
+                busy = true;
+            }
+
+            // (the L2 would-be outcome arming for F3 learning now happens inside ProcessBrick)
+            // F3 blank -> Layer-2 behaviour (same rule as the LONG/SHORT Layer-3 files): F3 gate always open.
+            bool f3OK = filter3Patterns.Count == 0 || isArmed3;
+            if (longMatch)
+            {
+                if (isArmed && f3OK && !busy && EnableRealOrder) { TryOpenRealTrade(+1); busy = true; }
+                else DiagLog("[LONG SIGNAL] " + (!isArmed ? "not armed (F2)" : !f3OK ? "L2 obs only (F3 not armed)" : busy ? "skipped (busy)" : "obs only (real orders off)"));
+            }
+            if (shortMatch)
+            {
+                if (isArmed && f3OK && !busy && EnableRealOrder) { TryOpenRealTrade(-1); }
+                else DiagLog("[SHORT SIGNAL] " + (!isArmed ? "not armed (F2)" : !f3OK ? "L2 obs only (F3 not armed)" : busy ? "skipped (busy)" : "obs only (real orders off)"));
+            }
+        }
+
+        // =====================================================================
+        // PIPELINE (shared by live bricks and the seed replay)
+        // =====================================================================
+        // Bit from close-vs-close; an equal close repeats the previous bit.
+        private int BitFor(double close, double prevClose)
+        {
+            int bit;
+            if (close > prevClose)      bit = 1;   // up brick  (green)
+            else if (close < prevClose) bit = 0;   // down brick (red)
+            else                        bit = (prevBarBit >= 0) ? prevBarBit : 0;
+            prevBarBit = bit;
+            return bit;
+        }
+
+        // One brick through the pipeline. Never places orders. 'live' only controls logging.
+        private void ProcessBrick(int bit, bool live, out bool longMatch, out bool shortMatch)
+        {
+            // ── L1: collect prior-match observation outcomes (merged, win-encoded) -> re-evaluate F2
+            // long win = green next (bit==1); short win = red next (bit==0)
+            if (waitLongOutcome)
+            {
+                waitLongOutcome = false;
+                filter1Outcome.Append(bit == 1 ? "1" : "0");
+                isArmed = TailMatchesAnyF2(filter1Outcome.ToString());
+                if (live) DiagLog(isArmed ? "[F2 MATCH] armed=true" : "[F2] armed=false");
+            }
+            if (waitShortOutcome)
+            {
+                waitShortOutcome = false;
+                filter1Outcome.Append(bit == 0 ? "1" : "0");
+                isArmed = TailMatchesAnyF2(filter1Outcome.ToString());
+                if (live) DiagLog(isArmed ? "[F2 MATCH] armed=true" : "[F2] armed=false");
+            }
+            if (filter1Outcome.Length > 2048) filter1Outcome.Remove(0, filter1Outcome.Length - 2048);
+
+            // ── L3: collect ARMED (L2) would-be-trade outcomes -> re-evaluate F3 (win-encoded)
+            if (waitLongOutcome2)
+            {
+                waitLongOutcome2 = false;
+                filter2Outcome.Append(bit == 1 ? "1" : "0");   // long L2 trade wins on next GREEN
+                isArmed3 = TailMatchesAnyF3(filter2Outcome.ToString());
+                if (live) DiagLog(isArmed3 ? "[F3 MATCH] armed3=true" : "[F3] armed3=false");
+            }
+            if (waitShortOutcome2)
+            {
+                waitShortOutcome2 = false;
+                filter2Outcome.Append(bit == 0 ? "1" : "0");   // short L2 trade wins on next RED
+                isArmed3 = TailMatchesAnyF3(filter2Outcome.ToString());
+                if (live) DiagLog(isArmed3 ? "[F3 MATCH] armed3=true" : "[F3] armed3=false");
+            }
+            if (filter2Outcome.Length > 2048) filter2Outcome.Remove(0, filter2Outcome.Length - 2048);
+
+            // ── append bit to both strings
+            longStr.Append(bit == 1 ? "1" : "0");
+            shortStr.Append(bit == 1 ? "0" : "1");
+            if (longStr.Length  > 2048) longStr.Remove(0, longStr.Length - 2048);
+            if (shortStr.Length > 2048) shortStr.Remove(0, shortStr.Length - 2048);
+
+            // ── test F1 against BOTH books
+            longMatch  = TailMatchesAny(longStr.ToString());
+            shortMatch = TailMatchesAny(shortStr.ToString());
+
+            // ── observation arm (collect next-brick outcome regardless of trading)
+            if (longMatch)  waitLongOutcome  = true;
+            if (shortMatch) waitShortOutcome = true;
+
+            // ── L2 would-be trade = F1 transit while F2-armed -> record its outcome into
+            //    filter2Outcome next brick (always, for F3 learning; independent of real trading)
+            if (longMatch  && isArmed) waitLongOutcome2  = true;
+            if (shortMatch && isArmed) waitShortOutcome2 = true;
+        }
+
+        // =====================================================================
+        // SEED BACK-FILL — replay closed bricks of the CURRENT SESSION.
+        // Close[0] is the first live brick. Bricks Close[1..k] closed before enable.
+        // k = the smaller of SeedBrickCount and "bricks back to the session start".
+        // The session's first brick is included (its bit compares to the prior
+        // session's last brick, exactly as the live code does at a session roll).
+        // =====================================================================
+        private void ReplaySeedBricks()
+        {
+            if (Bars.IsFirstBarOfSession)
+            {
+                DiagLog("[SEED] first live brick opens a new session -> nothing to back-fill (session gate).");
+                return;
+            }
+
+            int maxN = Math.Max(1, SeedBrickCount);
+            int k = 0;
+            string stopReason = "SeedBrickCount (" + maxN + ") reached";
+            for (int i = 1; i <= maxN; i++)
+            {
+                if (i + 1 > CurrentBar) { stopReason = "no older bricks loaded (increase Days to load)"; break; }
+                k = i;
+                if (Bars.IsFirstBarOfSessionByIndex(CurrentBar - i)) { stopReason = "session start reached"; break; }
+            }
+
+            if (k == 0)
+            {
+                DiagLog("[SEED] no closed bricks available to back-fill (" + stopReason + ").");
+                return;
+            }
+
+            for (int i = k; i >= 1; i--)   // oldest first
+            {
+                int bit = BitFor(Close[i], Close[i + 1]);
+                bool lm, sm;
+                ProcessBrick(bit, false, out lm, out sm);
+            }
+
+            DiagLog(string.Format("[SEED] back-filled {0} brick(s): {1:yyyy-MM-dd HH:mm:ss} -> {2:yyyy-MM-dd HH:mm:ss} "
+                + "(stopped: {3}). Observation only - no orders, not counted in MaxTotalBarCount.",
+                k, Time[k], Time[1], stopReason));
+            DiagLog(string.Format("[SEED] state after back-fill | longTail={0} shortTail={1} | f1out={2} | armedF2={3} | f2out={4} | armedF3={5}",
+                TailOf(longStr, 24), TailOf(shortStr, 24), ("(" + filter1Outcome.Length + ") " + filter1Outcome.ToString()), isArmed,
+                ("(" + filter2Outcome.Length + ") " + filter2Outcome.ToString()), isArmed3));
+        }
+
+        // =====================================================================
+        // TryOpenRealTrade(side) — direction-aware entry + flipped bracket
+        // =====================================================================
+        private void TryOpenRealTrade(int side)
+        {
+            if (EnableTradingHours && !WithinTradingHours())
+            { DiagLog("[OUTSIDE HOURS] suppressed"); return; }
+            if (EnableMarginCutoff && marginActive)
+            { DiagLog("[MARGIN CUTOFF] entry blocked (early EOD before overnight-margin snapshot)"); return; }
+
+            currentQty = CalcQty();
+            if (currentQty <= 0) { DiagLog("[QTY SKIP] qty rule returned 0"); return; }
+
+            double refPrice = (side > 0) ? GetCurrentAsk() : GetCurrentBid();
+            if (refPrice <= 0) { DiagLog("[TRADE ABORT] no valid price"); return; }
+
+            awaitingClose = true;
+            entryInFlight = true;
+            entryFillUtc  = DateTime.MinValue;   // not filled yet; naked guard dormant until the fill stamps it
+            openModifyRejectLogged = false;      // reset per-trade open-modify-reject note
+            winQtyThisTrade  = 0;                // reset per-trade win/loss quantity tally
+            lossQtyThisTrade = 0;
+            tradeSide     = side;
+
+            double brickClose = Close[0];
+            double stopPrice, targetPrice;
+            if (side > 0)   // LONG: stop below, target above
+            {
+                stopPrice   = Instrument.MasterInstrument.RoundToTickSize(brickClose - StopLossPoints);
+                targetPrice = Instrument.MasterInstrument.RoundToTickSize(brickClose + ProfitTargetPoints);
+            }
+            else            // SHORT: stop above, target below
+            {
+                stopPrice   = Instrument.MasterInstrument.RoundToTickSize(brickClose + StopLossPoints);
+                targetPrice = Instrument.MasterInstrument.RoundToTickSize(brickClose - ProfitTargetPoints);
+            }
+
+            string sig = (side > 0) ? ENTRY_LONG : ENTRY_SHORT;
+            SetStopLoss(sig, CalculationMode.Price, stopPrice, false);
+            SetProfitTarget(sig, CalculationMode.Price, targetPrice);
+
+            try
+            {
+                if (side > 0)
+                {
+                    if (UseMarketEntry) EnterLong(currentQty, sig);
+                    else EnterLongLimit(0, true, currentQty,
+                        Instrument.MasterInstrument.RoundToTickSize(refPrice - LimitOffsetPoints), sig);
+                }
+                else
+                {
+                    if (UseMarketEntry) EnterShort(currentQty, sig);
+                    else EnterShortLimit(0, true, currentQty,
+                        Instrument.MasterInstrument.RoundToTickSize(refPrice + LimitOffsetPoints), sig);
+                }
+                DiagLog(string.Format("MONEY TRADE #{0} {1} qty={2} brickClose={3:F2} stop={4:F2} target={5:F2} | real={6}",
+                    barCount, side > 0 ? "LONG" : "SHORT", currentQty, brickClose, stopPrice, targetPrice,
+                    TailOf(realTradeOutcome, 12)));
+            }
+            catch (Exception ex)
+            {
+                DiagLog("TryOpenRealTrade error: " + ex.Message);
+                awaitingClose = false; entryInFlight = false; tradeSide = 0;
+            }
+        }
+
+        // =====================================================================
+        // OnExecutionUpdate — entry fill tracking + bracket close -> W/L
+        // =====================================================================
+        protected override void OnExecutionUpdate(Execution execution, string executionId,
+            double price, int quantity, MarketPosition marketPosition, string orderId, DateTime time)
+        {
+            if (execution == null || execution.Order == null) return;
+            string oName = execution.Order.Name ?? "";
+            bool isEntry = (oName == ENTRY_LONG || oName == ENTRY_SHORT);
+
+            if (isEntry)
+            {
+                entryFillPrice = price;
+                entryFillQty  += quantity;
+                entryFillUtc   = DateTime.UtcNow;   // stamp fill -> starts the naked-guard grace window
+                if (execution.Order.OrderState == OrderState.Filled)
+                    entryInFlight = false;
+                // If we're shutting down while the entry is still filling, re-drive the flatten so
+                // the newly-arrived contracts get covered (same fix as Layer 1, test3).
+                if (pendingFlatten) DoFlatten();
+                return;
+            }
+
+            // Tally which bracket closed each contract, for MAJORITY-QUANTITY scoring.
+            //   Profit target -> win contracts;  Stop loss -> loss contracts;
+            //   our own flatten (ML3_Flatten / ML3_MarginFlat) does NOT vote (forced cleanup, not
+            //   a real outcome);  any unexpected name -> counted as loss (conservative).
+            if      (oName == "Profit target")                            winQtyThisTrade  += quantity;
+            else if (oName == "Stop loss")                                lossQtyThisTrade += quantity;
+            else if (oName == "ML3_Flatten" || oName == "ML3_MarginFlat") { /* flatten: does not vote */ }
+            else                                                          lossQtyThisTrade += quantity;
+
+            // once flat, record ONE bit for the whole (possibly multi-lot, possibly split) trade:
+            //   win-qty > loss-qty -> win (1);  tie or loss-qty >= win-qty -> loss (0).
+            if (Position.MarketPosition == MarketPosition.Flat && awaitingClose)
+            {
+                bool win = winQtyThisTrade > lossQtyThisTrade;
+                RecordTradeOutcome(win, price);
+            }
+
+            // re-drive shutdown completion on every fill (e.g. the flatten just filled).
+            if (pendingFlatten) DoFlatten();
+        }
+
+        private void RecordTradeOutcome(bool win, double exitPrice)
+        {
+            awaitingClose = false;
+            entryInFlight = false;
+            int side = tradeSide;
+            tradeSide = 0;
+
+            string bitStr = win ? "1" : "0";
+            realTradeOutcome.Append(bitStr);
+            sessionRealOutcome.Append(bitStr);
+            if (realTradeOutcome.Length > 2048) realTradeOutcome.Remove(0, realTradeOutcome.Length - 2048);
+
+            realLossesInARow = win ? 0 : (realLossesInARow + 1);
+            entryFillQty = 0;
+
+            DiagLog(string.Format("[TRADE CLOSED] side={0} {1} exit={2:F2} entry={3:F2} | winQty={4} lossQty={5} | real={6} | lossRow={7}",
+                side > 0 ? "LONG" : "SHORT", win ? "WIN" : "LOSS", exitPrice, entryFillPrice,
+                winQtyThisTrade, lossQtyThisTrade,
+                TailOf(realTradeOutcome, 12), realLossesInARow));
+
+            // exit-bit / trade-outcome halt (merged)
+            if (EnableTradeOutcomeExit && TailMatches(realTradeOutcome.ToString(), TradeOutcomeExitPattern))
+                BeginShutdown("trade-outcome exit '" + TradeOutcomeExitPattern + "' matched");
+        }
+
+        // =====================================================================
+        // OnOrderUpdate — ORPHAN GUARD
+        // Managed mode auto-submits the stop/target when the entry fills, but a
+        // fast spike (fill far from brickClose) or an OCO/partial-fill cascade can
+        // get a protective leg REJECTED. RealtimeErrorHandling=IgnoreRejects means
+        // NT will NOT flatten on that reject -> the position is left NAKED. This
+        // strategy never MODIFIES a bracket, so a Stop-loss/Profit-target reject can
+        // only mean "the bracket failed to attach" -> the position has no protection.
+        // Rule: any protective reject -> flatten immediately at market and halt.
+        // (An entry reject with nothing filled just releases the serialization lock
+        //  so the strategy can't freeze; a partial-filled entry that rejects is
+        //  treated as a naked position and flattened too.)
+        // =====================================================================
+        protected override void OnOrderUpdate(Order order, double limitPrice, double stopPrice,
+            int quantity, int filled, double averageFillPrice, OrderState orderState, DateTime time,
+            ErrorCode error, string comment)
+        {
+            if (order == null) return;
+
+            string nm = order.Name ?? "";
+            bool isProtective = (nm == "Stop loss" || nm == "Profit target");
+            bool isEntry      = (nm == ENTRY_LONG || nm == ENTRY_SHORT);
+
+            // a modify/REPLACE reject (e.g. NinjaTrader's OCO reduce-to-zero on a
+            // partial-fill exit) leaves the protective order LIVE at the broker. Force-cancel
+            // that leftover so it cannot fill later as an orphan. No shutdown here.
+            // Only when FLAT: a modify-rejected protective order is then a genuine leftover
+            // (orphan-in-waiting) -> force-cancel it. If the position is still OPEN the stop
+            // is still protecting live contracts, so we must NOT cancel it (that would leave
+            // a naked position). The reconciler + flat check below are the backstops.
+            if (error == ErrorCode.UnableToChangeOrder && isProtective
+                && Position.MarketPosition == MarketPosition.Flat
+                && (orderState == OrderState.Working || orderState == OrderState.Accepted
+                    || orderState == OrderState.PartFilled))
+            {
+                DiagLog(string.Format("[ORPHAN GUARD] flat & '{0}' modify rejected ({1}) -> force-canceling leftover order.", nm, error));
+                try { CancelOrder(order); } catch { }
+            }
+            else if (error == ErrorCode.UnableToChangeOrder && isProtective
+                && Position.MarketPosition != MarketPosition.Flat && !openModifyRejectLogged)
+            {
+                openModifyRejectLogged = true;   // once per trade; repeats on rapid partial fills
+                DiagLog(string.Format("[ORPHAN GUARD] '{0}' modify rejected ({1}) while OPEN -> leaving stop "
+                    + "in place (still protecting the position); the naked guard is the backstop.", nm, error));
+            }
+
+            // a REJECTED protective order -> flatten + shutdown (8:22 case).
+            if (orderState == OrderState.Rejected)
+            {
+                if (isProtective)
+                {
+                    DiagLog(string.Format("[ORPHAN GUARD] protective order '{0}' REJECTED ({1}) -> "
+                        + "position is unprotected, flattening at market now.", nm, error));
+                    BeginShutdown("protective order rejected (orphan guard)");
+                    return;
+                }
+
+                if (isEntry)
+                {
+                    if (hasOpenPosition())
+                    {
+                        DiagLog(string.Format("[ORPHAN GUARD] entry '{0}' REJECTED ({1}) but a partial "
+                            + "position exists -> flattening at market now.", nm, error));
+                        BeginShutdown("entry rejected with open position (orphan guard)");
+                    }
+                    else
+                    {
+                        DiagLog(string.Format("[ORPHAN GUARD] entry '{0}' REJECTED ({1}), nothing filled "
+                            + "-> clearing in-flight state so the strategy does not freeze.", nm, error));
+                        awaitingClose = false; entryInFlight = false; tradeSide = 0;
+                    }
+                }
+            }
+
+            // while shutting down, re-drive the flatten/terminate check on every order
+            // state change (e.g. a cancel just confirmed) so we finish once flat AND order-free.
+            if (pendingFlatten) DoFlatten();
+        }
+
+        // =====================================================================
+        // Qty rule (merged sessionRealOutcome) — longest-tail match wins
+        // =====================================================================
+        private int CalcQty()
+        {
+            int mult = 1;
+            if (EnableQtyIncrement && qtyTable != null)
+            {
+                string s = sessionRealOutcome.ToString();
+                int bestLen = -1;
+                foreach (var row in qtyTable)
+                {
+                    if (row.pattern.Length > s.Length) continue;
+                    if (s.EndsWith(row.pattern) && row.pattern.Length > bestLen)
+                    { bestLen = row.pattern.Length; mult = row.multiplier; }
+                }
+            }
+            int q = Math.Max(0, BaseQuantity * mult);
+            if (q != BaseQuantity)
+                DiagLog(string.Format("[QTY] sessionReal={0} -> mult applied -> qty={1}", sessionRealOutcome.ToString(), q));
+            return q;
+        }
+
+        private void ParseQtyRule()
+        {
+            var list = new System.Collections.Generic.List<(string, int)>();
+            string src = QtyRuleText ?? "";
+            int i = 0;
+            while (i < src.Length)
+            {
+                int q1 = src.IndexOf('"', i);
+                if (q1 < 0) break;
+                int q2 = src.IndexOf('"', q1 + 1);
+                if (q2 < 0) break;
+                string pat = src.Substring(q1 + 1, q2 - q1 - 1).Trim();
+                int colon = src.IndexOf(':', q2);
+                if (colon < 0) break;
+                int j = colon + 1;
+                while (j < src.Length && !char.IsDigit(src[j]) && src[j] != '-') j++;
+                int k = j;
+                while (k < src.Length && (char.IsDigit(src[k]) || src[k] == '-')) k++;
+                int mult;
+                if (j < k && int.TryParse(src.Substring(j, k - j), out mult)
+                    && pat.Length > 0 && pat.Trim('0', '1').Length == 0)
+                    list.Add((pat, mult));
+                i = (k > i) ? k : i + 1;
+            }
+            if (list.Count > 0) qtyTable = list.ToArray();
+            DiagLog("[QTY RULE] parsed " + list.Count + " rows from '" + QtyRuleText + "'");
+        }
+
+        // =====================================================================
+        // F1 / F2 / F3 parse + wildcard matcher (?=1+ ones, *=1+ zeros)
+        // =====================================================================
+        private void ParseFilter1Patterns()
+        {
+            filter1Patterns.Clear();
+            if (!string.IsNullOrEmpty(Filter1Pattern))
+                foreach (string tok in Filter1Pattern.Split(','))
+                {
+                    string t = (tok ?? "").Trim();
+                    if (t.Length == 0) continue;
+                    bool ok = true;
+                    foreach (char c in t) if (c != '0' && c != '1' && c != '*' && c != '?') { ok = false; break; }
+                    if (ok) filter1Patterns.Add(t);
+                }
+            DiagLog("[F1] active=[" + string.Join(",", filter1Patterns) + "]");
+        }
+
+        private bool TailMatchesAny(string text)
+        {
+            for (int i = 0; i < filter1Patterns.Count; i++)
+                if (TailMatches(text, filter1Patterns[i])) return true;
+            return false;
+        }
+
+        private void ParseFilter2Patterns()
+        {
+            filter2Patterns.Clear();
+            if (!string.IsNullOrEmpty(Filter2Pattern))
+                foreach (string tok in Filter2Pattern.Split(','))
+                {
+                    string t = (tok ?? "").Trim();
+                    if (t.Length == 0) continue;
+                    bool ok = true;
+                    foreach (char c in t) if (c != '0' && c != '1' && c != '*' && c != '?') { ok = false; break; }
+                    if (ok) filter2Patterns.Add(t);
+                }
+            DiagLog("[F2] active=[" + string.Join(",", filter2Patterns) + "]");
+        }
+
+        private bool TailMatchesAnyF2(string text)
+        {
+            for (int i = 0; i < filter2Patterns.Count; i++)
+                if (TailMatches(text, filter2Patterns[i])) return true;
+            return false;
+        }
+
+        private void ParseFilter3Patterns()
+        {
+            filter3Patterns.Clear();
+            if (!string.IsNullOrEmpty(Filter3Pattern))
+                foreach (string tok in Filter3Pattern.Split(','))
+                {
+                    string t = (tok ?? "").Trim();
+                    if (t.Length == 0) continue;
+                    bool ok = true;
+                    foreach (char c in t) if (c != '0' && c != '1' && c != '*' && c != '?') { ok = false; break; }
+                    if (ok) filter3Patterns.Add(t);
+                }
+            DiagLog("[F3] active=[" + string.Join(",", filter3Patterns) + "]"
+                + (filter3Patterns.Count == 0 ? "  (blank -> Layer-2 behaviour)" : ""));
+        }
+
+        private bool TailMatchesAnyF3(string text)
+        {
+            for (int i = 0; i < filter3Patterns.Count; i++)
+                if (TailMatches(text, filter3Patterns[i])) return true;
+            return false;
+        }
+
+        private static bool HasWild(string p)
+        { for (int i = 0; i < p.Length; i++) if (p[i] == '*' || p[i] == '?') return true; return false; }
+
+        private static bool TailMatches(string text, string pattern)
+        {
+            if (string.IsNullOrEmpty(pattern) || string.IsNullOrEmpty(text)) return false;
+            if (!HasWild(pattern)) return text.Length >= pattern.Length && text.EndsWith(pattern);
+            for (int start = text.Length - 1; start >= 0; start--)
+                if (MatchHere(text, start, pattern, 0)) return true;
+            return false;
+        }
+
+        private static bool MatchHere(string text, int ti, string pattern, int pi)
+        {
+            while (pi < pattern.Length)
+            {
+                char pc = pattern[pi];
+                if (pc == '*' || pc == '?')
+                {
+                    char want = (pc == '*') ? '0' : '1';
+                    if (ti >= text.Length || text[ti] != want) return false;
+                    ti++;
+                    int maxC = ti;
+                    while (maxC < text.Length && text[maxC] == want) maxC++;
+                    for (int c = maxC; c >= ti; c--) if (MatchHere(text, c, pattern, pi + 1)) return true;
+                    return false;
+                }
+                else { if (ti >= text.Length || text[ti] != pc) return false; ti++; pi++; }
+            }
+            return ti == text.Length;
+        }
+
+        // =====================================================================
+        // helpers: price, position, hours, gap, shutdown, logging
+        // =====================================================================
+        private double GetCurrentAsk()
+        { try { return GetCurrentAsk(0) > 0 ? GetCurrentAsk(0) : Close[0]; } catch { return Close[0]; } }
+        private double GetCurrentBid()
+        { try { return GetCurrentBid(0) > 0 ? GetCurrentBid(0) : Close[0]; } catch { return Close[0]; } }
+
+        private bool hasOpenPosition()
+        { return Position != null && Position.MarketPosition != MarketPosition.Flat; }
+
+        private bool WithinTradingHours()
+        {
+            DateTime t = EasternNow();   // New York time
+            int cur = t.Hour * 60 + t.Minute;
+            int s = TradingStartHour * 60 + TradingStartMinute;
+            int e = TradingEndHour * 60 + TradingEndMinute;
+            return (s <= e) ? (cur >= s && cur <= e) : (cur >= s || cur <= e);
+        }
+
+        private void FreshStart(string reason, bool seed)
+        {
+            seedPending = seed;
+            longStr.Clear(); shortStr.Clear(); filter1Outcome.Clear(); filter2Outcome.Clear();
+            waitLongOutcome = false; waitShortOutcome = false; isArmed = false;
+            waitLongOutcome2 = false; waitShortOutcome2 = false; isArmed3 = false;
+            prevBarBit = -1;
+            string stamp = DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss");
+            try
+            {
+                if (!Directory.Exists(LogFolder)) Directory.CreateDirectory(LogFolder);
+                activeLogFilePath = Path.Combine(LogFolder, LogBaseName + "_" + stamp + ".csv");
+            }
+            catch { activeLogFilePath = null; }
+            DiagLog("[FRESH START] " + reason + " | seed=" + seed + " | new log=" + activeLogFilePath
+                + " | pipeline EMPTY" + (seed ? " (session back-fill runs on the first live brick)" : ", will arm naturally")
+                + " (no real trades until a transit fires).");
+            DiagLog(string.Format("{0} ready (MERGED L3). EnableRealOrder={1}, F1=[{2}], F2=[{3}], F3=[{11}], Stop={4}pt, Target={5}pt, "
+                + "ExitBit={6}({7}), MaxLossRow={8}, Seed={9}, RestartOnNewSession={10} | "
+                + "Hours={12}({13:00}:{14:00}-{15:00}:{16:00} NY) | MarginCutoff={17} flat@{18:00}:{19:00} NY "
+                + "(cutoff {20:00}:{21:00} lead {22}m)",
+                Name, EnableRealOrder, Filter1Pattern, Filter2Pattern, StopLossPoints, ProfitTargetPoints,
+                EnableTradeOutcomeExit, TradeOutcomeExitPattern, MaxRealLossInARow,
+                SeedPendingBarOnStart ? ("ON(" + SeedBrickCount + " bricks, session-gated)") : "OFF", RestartOnNewSession, Filter3Pattern,
+                EnableTradingHours ? "ON" : "OFF", TradingStartHour, TradingStartMinute, TradingEndHour, TradingEndMinute,
+                EnableMarginCutoff ? "ON" : "OFF",
+                (MarginCutoffHour * 60 + MarginCutoffMinute - MarginCutoffLeadMin) / 60,
+                (MarginCutoffHour * 60 + MarginCutoffMinute - MarginCutoffLeadMin) % 60,
+                MarginCutoffHour, MarginCutoffMinute, MarginCutoffLeadMin));
+
+            // One-time reminder when REAL orders are live: the biggest naked-position risk is NOT
+            // in this strategy's code -- it is NinjaTrader's connection-loss handling, a PLATFORM
+            // setting this strategy cannot see or control. Prompt the user to go think about it.
+            if (EnableRealOrder)
+            {
+                DiagLog("[!! CHECK PLATFORM SETTING !!] Real orders are ON. Before trading, review "
+                    + "Tools -> Options -> Strategies -> 'On connection loss'. If a disconnect lasts "
+                    + "longer than your Disconnect-delay, NinjaTrader can STOP this strategy and (with "
+                    + "Recalculate + WaitUntilFlat) CANCEL your stop/target -> leaving a NAKED position "
+                    + "that NO code here can protect while the feed is down. Decide deliberately: "
+                    + "'Recalculate' vs 'Keep Running', and how many seconds to ride out a brief drop. "
+                    + "This depends on how reliable YOUR connection is and what you want to happen if it "
+                    + "isn't -- learn how both options behave before choosing. (Platform setting; applies "
+                    + "to ALL strategies on this connection, not just this one.)");
+            }
+            DiagLog(string.Format("[CLOCK] Strategy follows NEW YORK time (Wall St. bell). New York now={0:HH:mm:ss}, "
+                + "this platform/log clock={1:HH:mm:ss}. All hour params are New York time; log timestamps are platform time.",
+                EasternNow(), DateTime.Now));
+        }
+
+        private void BeginShutdown(string reason)
+        {
+            if (pendingFlatten) return;
+            pendingFlatten = true;
+            pendingReason  = reason;
+            DiagLog("[SHUTDOWN] " + reason + " -> flatten + disable");
+            StartFlattenTimer();   // heartbeat first, so it is running even if this first pass is throttled
+            DoFlatten();
+        }
+
+        // =====================================================================
+        // SHUTDOWN HEARTBEAT. DoFlatten only runs when an event wakes it (fill, order
+        // update, brick) and it is throttled to one pass per second. If several fills
+        // land inside that same second, every wake-up can be throttled and nothing
+        // else would wake it until the next brick. This timer wakes it ~once per
+        // second until flat AND order-free (or the 8-pass cap gives up). The throttle
+        // and cap are unchanged, so it can still never spam orders.
+        // =====================================================================
+        private void StartFlattenTimer()
+        {
+            if (flattenTimer != null) return;
+            try
+            {
+                flattenTimer = new System.Timers.Timer(1000);
+                flattenTimer.AutoReset = true;
+                flattenTimer.Elapsed += OnFlattenHeartbeat;
+                flattenTimer.Start();
+            }
+            catch (Exception ex) { DiagLog("[SHUTDOWN] heartbeat start error: " + ex.Message); }
+        }
+
+        private void StopFlattenTimer()
+        {
+            System.Timers.Timer t = flattenTimer;
+            flattenTimer = null;
+            if (t == null) return;
+            try { t.Stop(); t.Elapsed -= OnFlattenHeartbeat; t.Dispose(); } catch { }
+        }
+
+        private void OnFlattenHeartbeat(object sender, System.Timers.ElapsedEventArgs e)
+        {
+            try
+            {
+                // TriggerCustomEvent runs the callback on the strategy's own thread with a
+                // valid bar context, so DoFlatten can read Position and submit orders safely.
+                TriggerCustomEvent(o =>
+                {
+                    if (State != State.Realtime || !pendingFlatten || flattenGaveUp) { StopFlattenTimer(); return; }
+                    DoFlatten();
+                }, null);
+            }
+            catch { }
+        }
+
+        // =====================================================================
+        // NEW YORK (ET) CLOCK. All hour parameters (trading hours + margin cutoff) are
+        // NEW YORK time. We derive it from UTC so DST is automatic and the platform/chart
+        // timezone and the user's location are irrelevant - type New York numbers, always.
+        // (Live/realtime uses the true current time. NOTE: Playback/Replay uses the real
+        //  wall clock, not the replayed session time.) Log timestamps stay in platform time;
+        // the [CLOCK] startup line prints both so the offset is obvious.
+        // =====================================================================
+        private TimeZoneInfo _etZone = null;
+        private bool _etWarned = false;
+        private TimeZoneInfo EasternZone()
+        {
+            if (_etZone != null) return _etZone;
+            try { _etZone = TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time"); }
+            catch
+            {
+                try { _etZone = TimeZoneInfo.FindSystemTimeZoneById("America/New_York"); }
+                catch { _etZone = null; }
+            }
+            return _etZone;
+        }
+        private DateTime EasternNow()
+        {
+            TimeZoneInfo z = EasternZone();
+            if (z == null)
+            {
+                if (!_etWarned) { DiagLog("[CLOCK] WARNING: New York time zone not found; using platform local time - hour params may be wrong."); _etWarned = true; }
+                return DateTime.Now;
+            }
+            return TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, z);
+        }
+
+        // =====================================================================
+        // Margin cutoff - an EARLY end-of-day, before the broker's overnight-margin
+        // snapshot (Tradovate/NinjaTrader: 16:45 ET = 3:45 CT). Driven by the 1-min
+        // clock series so it fires on time even if Renko bricks are sparse. At the
+        // cutoff it flattens any open position and refuses new entries through the
+        // real session close (~17:00 ET), releasing at the 18:00 ET reopen. Flatten
+        // ONLY - it does not disable the strategy; it resumes next session. Turn off
+        // via EnableMarginCutoff if the account is well-funded for overnight margin.
+        // =====================================================================
+        private void CheckMarginCutoff()
+        {
+            if (!EnableMarginCutoff) { marginActive = false; marginLogged = false; return; }
+            if (State != State.Realtime) return;
+            if (CurrentBars.Length < 2 || CurrentBars[1] < 0) return;
+
+            DateTime t = EasternNow();                      // true New York time (UTC-derived, DST-safe)
+            int nowMin     = t.Hour * 60 + t.Minute;
+            int flattenMin = MarginCutoffHour * 60 + MarginCutoffMinute - MarginCutoffLeadMin;
+            // Block window is RELATIVE to the flatten time (not a fixed 18:00), so any cutoff
+            // works - including evening test times. ~80 min covers flatten -> ~market reopen
+            // for the default 16:40 cutoff (16:40 -> 18:00), keeping you flat through the 16:45
+            // snapshot and the 17:00-18:00 break.
+            const int blockMinutes = 80;
+            bool active    = (nowMin >= flattenMin && nowMin < flattenMin + blockMinutes);
+
+            if (active && !marginLogged)
+            {
+                DiagLog(string.Format("[MARGIN CUTOFF] window active (New York now {0:HH:mm}) - flatten @ {1:00}:{2:00} "
+                    + "New York: early EOD, no new entries (before {3:00}:{4:00} New York overnight-margin snapshot).",
+                    t, flattenMin / 60, flattenMin % 60, MarginCutoffHour, MarginCutoffMinute));
+                marginLogged = true;
+            }
+            if (!active) marginLogged = false;
+            marginActive = active;
+
+            if (marginActive && Position.MarketPosition != MarketPosition.Flat)
+                MarginFlatten();
+        }
+
+        private void MarginFlatten()
+        {
+            try
+            {
+                // barsInProgressIndex=0 forces the exit onto the PRIMARY series even when this
+                // is called from the 1-min clock (BarsInProgress==1), per NinjaTrader's rule that
+                // same-instrument orders must target the first bars context.
+                if (Position.MarketPosition == MarketPosition.Short)
+                    ExitShort(0, Math.Abs(Position.Quantity), "ML3_MarginFlat", "");
+                else if (Position.MarketPosition == MarketPosition.Long)
+                    ExitLong(0, Math.Abs(Position.Quantity), "ML3_MarginFlat", "");
+            }
+            catch (Exception ex) { DiagLog("[MARGIN CUTOFF] flatten error: " + ex.Message); }
+        }
+        // Cancel THIS strategy's own live orders only (the 'Orders' collection is this
+        // instance's orders, never the account's) so no leftover stop/target/partial can
+        // linger and fill later as an orphan. Includes PartFilled.
+        private void CancelMyLiveOrders()
+        {
+            var snap = new System.Collections.Generic.List<Order>();
+            foreach (Order o in Orders) if (o != null) snap.Add(o);
+            foreach (Order o in snap)
+            {
+                OrderState s = o.OrderState;
+                if (s == OrderState.Working || s == OrderState.Accepted
+                    || s == OrderState.PartFilled || s == OrderState.Submitted
+                    || s == OrderState.ChangePending)
+                { try { CancelOrder(o); } catch { } }
+            }
+        }
+
+        // True if any of THIS strategy's orders could still fill (not yet terminal).
+        private bool HasLiveOrders()
+        {
+            foreach (Order o in Orders)
+            {
+                if (o == null) continue;
+                OrderState s = o.OrderState;
+                if (s == OrderState.Working || s == OrderState.Accepted
+                    || s == OrderState.PartFilled || s == OrderState.Submitted
+                    || s == OrderState.ChangePending || s == OrderState.CancelPending)
+                    return true;
+            }
+            return false;
+        }
+
+        // True if THIS strategy has a live (non-terminal) Stop loss order -> position is
+        // protected on the downside. Used by the naked-position guard.
+        private bool HasLiveStop()
+        {
+            foreach (Order o in Orders)
+            {
+                if (o == null) continue;
+                if ((o.Name ?? "") != "Stop loss") continue;
+                OrderState s = o.OrderState;
+                bool terminal = (s == OrderState.Cancelled || s == OrderState.Filled
+                    || s == OrderState.Rejected || s == OrderState.Unknown);
+                if (!terminal) return true;
+            }
+            return false;
+        }
+
+        private void DoFlatten()
+        {
+            if (inDoFlatten) return;   // a nested call (order submit -> OnOrderUpdate) must not fire again
+            inDoFlatten = true;
+            try
+            {
+            try
+            {
+                // Clean-up loop for BOTH shutdown cases (a bracket that never built -> naked from
+                // the start, OR a bracket that built then got messed up / flipped). Each pass, at
+                // most once per second and up to MaxFlattenAttempts times:
+                //   (1) cancel OUR OWN live orders FIRST (never our own ML3_Flatten) so no hidden
+                //       stop/target can fill and open a NEW position behind us;
+                //   (2) read the LIVE position -- direction AND size, because it can be long, short
+                //       (a flip), or a different quantity than last look -- and close exactly that
+                //       at market with an EMPTY-signal exit (not tied to any entry, so NinjaTrader
+                //       cannot ignore it the way it ignored the entry-bound form in test5).
+                // Repeat (re-driven by fills / order updates / the 1-sec heartbeat) until flat AND
+                // no live orders, then disable. Hard-capped so it can NEVER loop or spam market orders.
+                if (!flattenGaveUp
+                    && (DateTime.UtcNow - lastFlattenUtc).TotalSeconds >= 1.0
+                    && (Position.MarketPosition != MarketPosition.Flat || HasLiveOrders()))
+                {
+                    if (flattenAttempts < MaxFlattenAttempts)
+                    {
+                        // (1) cancel our own live orders first -- only THIS strategy's, and never
+                        //     our own ML3_Flatten market order that is doing the closing.
+                        foreach (Order o in Orders)
+                        {
+                            if (o == null) continue;
+                            if ((o.Name ?? "") == "ML3_Flatten") continue;
+                            OrderState s = o.OrderState;
+                            if (s == OrderState.Working || s == OrderState.Accepted
+                                || s == OrderState.PartFilled || s == OrderState.Submitted
+                                || s == OrderState.ChangePending)
+                            { try { CancelOrder(o); } catch { } }
+                        }
+
+                        // (2) close whatever position is actually there RIGHT NOW (fresh read).
+                        if (Position.MarketPosition == MarketPosition.Long)
+                        {
+                            int q = Math.Abs(Position.Quantity);
+                            ExitLong(0, q, "ML3_Flatten", "");
+                            DiagLog("[SHUTDOWN] pass " + (flattenAttempts + 1) + "/" + MaxFlattenAttempts
+                                + ": canceled own orders, closing LONG " + q + ".");
+                        }
+                        else if (Position.MarketPosition == MarketPosition.Short)
+                        {
+                            int q = Math.Abs(Position.Quantity);
+                            ExitShort(0, q, "ML3_Flatten", "");
+                            DiagLog("[SHUTDOWN] pass " + (flattenAttempts + 1) + "/" + MaxFlattenAttempts
+                                + ": canceled own orders, closing SHORT " + q + ".");
+                        }
+                        else
+                        {
+                            DiagLog("[SHUTDOWN] pass " + (flattenAttempts + 1) + "/" + MaxFlattenAttempts
+                                + ": flat, canceling leftover order(s).");
+                        }
+                        flattenAttempts++;
+                        lastFlattenUtc = DateTime.UtcNow;
+                    }
+                    else
+                    {
+                        flattenGaveUp = true;
+                        StopFlattenTimer();
+                        DiagLog("[SHUTDOWN][FLATTEN FAILED] not flat & order-free after " + MaxFlattenAttempts
+                            + " passes -> STOPPING (no more orders). CHECK ACCOUNT AND FLATTEN BY HAND.");
+                    }
+                }
+            }
+            catch (Exception ex) { DiagLog("[SHUTDOWN] flatten error: " + ex.Message); }
+
+            // Terminate ONLY when flat AND no live orders remain (both confirmed).
+            if (Position.MarketPosition == MarketPosition.Flat && !HasLiveOrders())
+            {
+                try { DiagLog("[SHUTDOWN] flat & no working orders -> disabling."); } catch { }
+                pendingFlatten = false;
+                StopFlattenTimer();
+                try { SetState(State.Terminated); } catch { }
+            }
+            }
+            finally { inDoFlatten = false; }
+        }
+
+        private string TailOf(StringBuilder sb, int n)
+        {
+            int len = sb.Length;
+            if (len <= n) return sb.ToString();
+            return sb.ToString(len - n, n);
+        }
+
+        private void DiagLog(string msg)
+        {
+            string line = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + "  " + msg;
+            try
+            {
+                if (activeLogFilePath != null)
+                    File.AppendAllText(activeLogFilePath, line + Environment.NewLine);
+            }
+            catch { }
+            Print(line);
+        }
+
+        #region Properties
+        [NinjaScriptProperty] [Display(Name="Enable Real Order", Order = 1, GroupName = "1. Filter & Order")]
+        public bool EnableRealOrder { get; set; }
+
+        [NinjaScriptProperty] [Display(Name="F1 Pattern (comma OR; ?=1+ ones *=1+ zeros)", Order = 2, GroupName = "1. Filter & Order")]
+        public string Filter1Pattern { get; set; }
+
+        [NinjaScriptProperty] [Display(Name="F2 Pattern (comma OR; on MERGED outcome; arms next transit)", Order = 3, GroupName = "1. Filter & Order")]
+        public string Filter2Pattern { get; set; }
+
+        [NinjaScriptProperty] [Display(Name="F3 Pattern (comma OR; on ARMED-trade outcome; blank = Layer-2 behaviour)", Order = 4, GroupName = "1. Filter & Order")]
+        public string Filter3Pattern { get; set; }
+
+        [NinjaScriptProperty] [Range(1,int.MaxValue)] [Display(Name="Base Quantity", Order = 1, GroupName = "2. Quantity")]
+        public int BaseQuantity { get; set; }
+
+        [NinjaScriptProperty] [Browsable(false)] [Display(Name="Use Market Entry", Order = 1, GroupName = "4. Entry & Bracket")]
+        public bool UseMarketEntry { get; set; }
+
+        [NinjaScriptProperty] [Browsable(false)] [Range(0,double.MaxValue)] [Display(Name="Limit Offset Points", Order = 2, GroupName = "4. Entry & Bracket")]
+        public double LimitOffsetPoints { get; set; }
+
+        [NinjaScriptProperty] [Range(0.25,double.MaxValue)] [Display(Name="Stop Loss Points", Order = 3, GroupName = "4. Entry & Bracket")]
+        public double StopLossPoints { get; set; }
+
+        [NinjaScriptProperty] [Range(0.25,double.MaxValue)] [Display(Name="Profit Target Points", Order = 4, GroupName = "4. Entry & Bracket")]
+        public double ProfitTargetPoints { get; set; }
+
+        [NinjaScriptProperty] [Display(Name="Enable Qty Increment", Order = 2, GroupName = "2. Quantity")]
+        public bool EnableQtyIncrement { get; set; }
+
+        [NinjaScriptProperty] [Display(Name="Qty Rule Text", Order = 3, GroupName = "2. Quantity")]
+        public string QtyRuleText { get; set; }
+
+        [NinjaScriptProperty] [Range(1,int.MaxValue)] [Display(Name="Max Real Loss In A Row (breaker)", Order = 1, GroupName = "3. Limits & Exit")]
+        public int MaxRealLossInARow { get; set; }
+
+        [NinjaScriptProperty] [Display(Name="Enable Trade-Outcome Exit", Order = 2, GroupName = "3. Limits & Exit")]
+        public bool EnableTradeOutcomeExit { get; set; }
+
+        [NinjaScriptProperty] [Display(Name="Trade-Outcome Exit Pattern (1=win-and-quit)", Order = 3, GroupName = "3. Limits & Exit")]
+        public string TradeOutcomeExitPattern { get; set; }
+
+        [NinjaScriptProperty] [Display(Name="Enable Trading Hours", Order = 1, GroupName = "5. Hours")]
+        public bool EnableTradingHours { get; set; }
+
+        [NinjaScriptProperty] [Range(0,23)] [Display(Name="Start Hour (New York time)", Order = 2, GroupName = "5. Hours")]
+        public int TradingStartHour { get; set; }
+
+        [NinjaScriptProperty] [Range(0,59)] [Display(Name="Start Minute (New York)", Order = 3, GroupName = "5. Hours")]
+        public int TradingStartMinute { get; set; }
+
+        [NinjaScriptProperty] [Range(0,23)] [Display(Name="End Hour (New York time)", Order = 4, GroupName = "5. Hours")]
+        public int TradingEndHour { get; set; }
+
+        [NinjaScriptProperty] [Range(0,59)] [Display(Name="End Minute (New York)", Order = 5, GroupName = "5. Hours")]
+        public int TradingEndMinute { get; set; }
+
+        [NinjaScriptProperty] [Range(1,int.MaxValue)] [Display(Name="Strategy Life Minutes", Order = 1, GroupName = "6. Session")]
+        public int StrategyLifeMinutes { get; set; }
+
+        [NinjaScriptProperty] [Range(1,int.MaxValue)] [Display(Name="Max Total Bar Count", Order = 4, GroupName = "3. Limits & Exit")]
+        public int MaxTotalBarCount { get; set; }
+
+        [NinjaScriptProperty] [Display(Name="Seed: back-fill history on start", Order = 5, GroupName = "1. Filter & Order")]
+        public bool SeedPendingBarOnStart { get; set; }
+
+        [NinjaScriptProperty] [Range(1,int.MaxValue)] [Display(Name="Seed brick count (max bricks back, current session only)", Order = 6, GroupName = "1. Filter & Order")]
+        public int SeedBrickCount { get; set; }
+
+        [NinjaScriptProperty] [Display(Name="Restart clean on new session (ETH template keeps the overnight warm-up)", Order = 2, GroupName = "6. Session")]
+        public bool RestartOnNewSession { get; set; }
+
+        [NinjaScriptProperty] [Display(Name="Log Folder", Order = 1, GroupName = "8. Logging")]
+        public string LogFolder { get; set; }
+
+        [NinjaScriptProperty] [Display(Name="Log Base Name", Order = 2, GroupName = "8. Logging")]
+        public string LogBaseName { get; set; }
+
+        [NinjaScriptProperty] [Display(Name="Enable margin cutoff (early EOD before overnight-margin)", Order = 1, GroupName = "9. Margin")]
+        public bool EnableMarginCutoff { get; set; }
+
+        [NinjaScriptProperty] [Range(0,23)] [Display(Name="Broker margin cutoff Hour (New York time)", Order = 2, GroupName = "9. Margin")]
+        public int MarginCutoffHour { get; set; }
+
+        [NinjaScriptProperty] [Range(0,59)] [Display(Name="Broker margin cutoff Minute (New York)", Order = 3, GroupName = "9. Margin")]
+        public int MarginCutoffMinute { get; set; }
+
+        [NinjaScriptProperty] [Range(0,120)] [Display(Name="Flatten lead minutes (before cutoff)", Order = 4, GroupName = "9. Margin")]
+        public int MarginCutoffLeadMin { get; set; }
+        #endregion
+    }
+}
