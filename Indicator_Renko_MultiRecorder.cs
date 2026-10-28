@@ -21,6 +21,12 @@ public enum RecorderHudCorner { BottomLeft, BottomRight, TopLeft, TopRight, Cent
 // =============================================================================
 // Indicator_Renko_MultiRecorder  —  up to 10 Renko transit setups in ONE indicator (observer)
 // =============================================================================
+// v1.2 2026-10-28
+//   * MARKET SPEED: average seconds per brick over the last N closed bricks (default 10, never
+//     crosses the session start) + the last brick's seconds, labelled FAST / NORMAL / SLOW /
+//     SUPER SLOW by three thresholds (default 30 / 90 / 300 s). Shown on the HUD (2nd line) and
+//     written to the state file ("speed") for Renko_Recorder_Viewer.html. Settings: "Common 5. Speed".
+//     Observer only - the setup strings, alerts and logs are unchanged.
 // v1.1 2026-10-27
 //   * HUD first line reminds that it is the short version (full strings: Renko_Recorder_Viewer.html).
 //   * "0s in a row" on the deepest (last-layer) string: number of 0's after its last 1
@@ -168,6 +174,10 @@ namespace NinjaTrader.NinjaScript.Indicators
                 EnableAlertHours       = true;
                 AlertStartHourET = 9;  AlertStartMinuteET = 30;
                 AlertEndHourET   = 16; AlertEndMinuteET   = 0;
+                SpeedWindowBricks      = 10;
+                SpeedFastMaxSeconds    = 30;
+                SpeedNormalMaxSeconds  = 90;
+                SpeedSlowMaxSeconds    = 300;
             }
             else if (State == State.Realtime)
             {
@@ -510,6 +520,43 @@ namespace NinjaTrader.NinjaScript.Indicators
                  + ",\"trail0\":" + Trail0(s) + ",\"s\":" + J(s.ToString()) + "}";
         }
 
+        // ── market speed: seconds per brick over the last N closed bricks (this session only) ──
+        // Brick i lasted Time[i] - Time[i+1]. Stops at the session's first brick so the overnight
+        // break never counts. Returns false when there is no brick gap to measure yet.
+        private bool CalcSpeed(out double avg, out double last, out int n)
+        {
+            avg = 0; last = -1; n = 0; double sum = 0;
+            int want = Math.Max(1, SpeedWindowBricks);
+            for (int i = 0; i < want && i + 1 <= CurrentBar; i++)
+            {
+                if (Bars.IsFirstBarOfSessionByIndex(CurrentBar - i)) break;   // gap would span the session break
+                double g = (Time[i] - Time[i + 1]).TotalSeconds;
+                if (g < 0) g = 0;
+                if (i == 0) last = g;
+                sum += g; n++;
+            }
+            if (n == 0) return false;
+            avg = sum / n;
+            return true;
+        }
+
+        private string SpeedLabel(double avg)
+        {
+            if (avg <= SpeedFastMaxSeconds)   return "FAST";
+            if (avg <= SpeedNormalMaxSeconds) return "NORMAL";
+            if (avg <= SpeedSlowMaxSeconds)   return "SLOW";
+            return "SUPER SLOW";
+        }
+
+        private static string Secs(double s)
+        {
+            if (s < 0) return "-";
+            int t = (int)Math.Round(s);
+            if (t < 60) return t + "s";
+            if (t < 3600) return (t / 60) + "m " + (t % 60).ToString("00") + "s";
+            return (t / 3600) + "h " + ((t / 60) % 60).ToString("00") + "m";
+        }
+
         private void WriteState()
         {
             if (!EnableLog) return;
@@ -525,8 +572,18 @@ namespace NinjaTrader.NinjaScript.Indicators
                   .Append(",\"since\":").Append(J(since == DateTime.MinValue ? "" : since.ToString("yyyy-MM-dd HH:mm:ss", ci)))
                   .Append(",\"history\":").Append(J(historyNote))
                   .Append(",\"rolling\":").Append(RollingWindowBits)
-                  .Append(",\"reset_on_new_session\":").Append(ResetOnNewSession ? "true" : "false")
-                  .Append(",\"setups\":[");
+                  .Append(",\"reset_on_new_session\":").Append(ResetOnNewSession ? "true" : "false");
+                double spAvg, spLast; int spN;
+                bool spOk = CalcSpeed(out spAvg, out spLast, out spN);
+                sb.Append(",\"speed\":{\"window\":").Append(Math.Max(1, SpeedWindowBricks))
+                  .Append(",\"n\":").Append(spN)
+                  .Append(",\"avg_s\":").Append(spOk ? spAvg.ToString("F1", ci) : "null")
+                  .Append(",\"last_s\":").Append(spOk ? spLast.ToString("F1", ci) : "null")
+                  .Append(",\"label\":").Append(J(spOk ? SpeedLabel(spAvg) : ""))
+                  .Append(",\"fast\":").Append(SpeedFastMaxSeconds)
+                  .Append(",\"normal\":").Append(SpeedNormalMaxSeconds)
+                  .Append(",\"slow\":").Append(SpeedSlowMaxSeconds).Append("}");
+                sb.Append(",\"setups\":[");
                 bool first = true;
                 foreach (Setup s in setups)
                 {
@@ -566,6 +623,10 @@ namespace NinjaTrader.NinjaScript.Indicators
               .Append("   updated ").Append(DateTime.Now.ToString("HH:mm:ss"))
               .Append(Environment.NewLine)
               .Append("(short version: last " + HudTailBits + " bits per setup - full strings in Renko_Recorder_Viewer.html)");
+            double spAvg, spLast; int spN;
+            sb.Append(Environment.NewLine).Append(CalcSpeed(out spAvg, out spLast, out spN)
+                ? "SPEED: " + SpeedLabel(spAvg) + "   avg " + Secs(spAvg) + " per brick over last " + spN + " bricks   (last brick " + Secs(spLast) + ")"
+                : "SPEED: -   (needs 2 bricks in this session)");
             foreach (Setup s in setups)
             {
                 if (!s.On) { if (s.Problem.Length > 0) sb.Append(Environment.NewLine).Append("S" + s.N.ToString("00") + " OFF: " + s.Problem); continue; }
@@ -810,6 +871,23 @@ namespace NinjaTrader.NinjaScript.Indicators
         [Range(0, 59)]
         [Display(Name="Alert end minute (ET)", Order=6, GroupName="Common 4. Alert")]
         public int AlertEndMinuteET { get; set; }
+
+        [Range(1, 500)]
+        [Display(Name="Speed: average over last N bricks", Order=1, GroupName="Common 5. Speed",
+            Description="Average seconds per brick over the last N closed bricks of this session (default 10).")]
+        public int SpeedWindowBricks { get; set; }
+
+        [Range(1, 86400)]
+        [Display(Name="FAST if average <= seconds", Order=2, GroupName="Common 5. Speed")]
+        public int SpeedFastMaxSeconds { get; set; }
+
+        [Range(1, 86400)]
+        [Display(Name="NORMAL if average <= seconds", Order=3, GroupName="Common 5. Speed")]
+        public int SpeedNormalMaxSeconds { get; set; }
+
+        [Range(1, 86400)]
+        [Display(Name="SLOW if average <= seconds (above = SUPER SLOW)", Order=4, GroupName="Common 5. Speed")]
+        public int SpeedSlowMaxSeconds { get; set; }
         #endregion
     }
 }

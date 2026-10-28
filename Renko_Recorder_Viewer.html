@@ -58,6 +58,13 @@
   .run b { color: var(--accent); }
   label.wrap { white-space: normal; }
   .chart { font-weight: 500; color: var(--muted); }
+  .spd { font-size: 12px; font-weight: 700; padding: 1px 8px; border-radius: 999px; letter-spacing: .3px; }
+  .spd.FAST { color: var(--accent); background: var(--accent-bg); }
+  .spd.NORMAL { color: var(--one); background: color-mix(in srgb, var(--one) 14%, transparent); }
+  .spd.SLOW { color: var(--money); background: var(--money-bg); }
+  .spd.SUPER { color: var(--off); background: color-mix(in srgb, var(--off) 18%, transparent); }
+  .speedrow { display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: center; margin: -2px 0 6px; color: var(--muted); font-size: 13px; }
+  .speedrow b { color: var(--ink); font-variant-numeric: tabular-nums; }
   .howto { max-width: 820px; margin: 0 auto; text-align: left; }
   .howto ol { margin: 6px 0 0; padding-left: 20px; }
   .howto li { margin: 3px 0; }
@@ -95,7 +102,9 @@
       <li><b>Fresh start (optional):</b> delete the old files ending in <code>_state.json</code> from the Log Folder. Running recorders write a new one on their next brick. Keep the <code>.csv</code> files — they are your history.</li>
     </ol>
     <p>Each recorder writes <code>&lt;LogBaseName&gt;_state.json</code> after every brick. The line with a dark left edge is the deepest (money) layer.
-    "0s in a row" = how many 0's follow the last 1 of that string.</p>
+    "0s in a row" = how many 0's follow the last 1 of that string.
+    <b>Market speed</b> = average seconds per brick over the last N bricks of this session (set in the indicator, "Common 5. Speed");
+    "this brick open" counts up live from the last brick close.</p>
   </div>
 </footer>
 
@@ -201,6 +210,13 @@
   function trail0(l) { if (typeof l.trail0 === 'number') return l.trail0; const s = l.s || ''; const k = s.lastIndexOf('1'); return s.length - k - 1; }
   function ago(ts) { if (!ts) return null; const t = new Date(ts.replace(' ', 'T')); return isNaN(t) ? null : (Date.now() - t) / 1000; }
   function hm(ts) { return ts ? ts.slice(11, 19) : ''; }
+  function secs(x) { if (x === null || x === undefined || isNaN(x)) return '-'; const t = Math.round(x);
+    if (t < 60) return t + 's'; if (t < 3600) return Math.floor(t / 60) + 'm ' + String(t % 60).padStart(2, '0') + 's';
+    return Math.floor(t / 3600) + 'h ' + String(Math.floor(t / 60) % 60).padStart(2, '0') + 'm'; }
+  function spdBadge(sp) { if (!sp || !sp.label) return ''; const c = sp.label === 'SUPER SLOW' ? 'SUPER' : sp.label;
+    return '<span class="spd ' + c + '" title="average ' + secs(sp.avg_s) + ' per brick over the last ' + sp.n + ' bricks">' + esc(sp.label) + ' ' + secs(sp.avg_s) + '</span>'; }
+  // label for a number of seconds using the recorder's own thresholds
+  function labelFor(sp, x) { return x <= sp.fast ? 'FAST' : x <= sp.normal ? 'NORMAL' : x <= sp.slow ? 'SLOW' : 'SUPER SLOW'; }
 
   function render() {
     const main = $('main'); const all = Object.keys(states).sort();
@@ -218,10 +234,23 @@
         + '<span' + (age !== null && age > STALE_S ? ' class="stale"' : '') + '>file written ' + esc(hm(st.written))
         + (age !== null && age > STALE_S ? ' (' + Math.round(age / 60) + ' min ago — slow market or NinjaTrader stopped?)' : '') + '</span>'
         + '<span>' + esc(st.history) + (st.reset_on_new_session ? '' : ' · strings continue across sessions') + '</span></div>';
+      const sp = st.speed;
+      if (sp) {
+        // "this brick open for" = time since NinjaTrader last wrote the file (written right after each brick closed)
+        const open = age !== null && age >= 0 ? age : null;
+        html += '<div class="speedrow"><span>market speed</span>' + (sp.label ? spdBadge(sp)
+            + '<span>avg <b>' + secs(sp.avg_s) + '</b> per brick over last <b>' + sp.n + '</b> bricks</span>'
+            + '<span>last brick <b>' + secs(sp.last_s) + '</b></span>'
+          : '<span>— needs 2 bricks in this session</span>')
+          + (open !== null ? '<span>this brick open <b>' + secs(open) + '</b>'
+             + (open > sp.slow ? ' <span class="spd SUPER">SUPER SLOW now</span>'
+                : sp.label && open > sp.normal && (sp.label === 'FAST' || sp.label === 'NORMAL') ? ' <span class="spd SLOW">slowing</span>' : '') + '</span>' : '')
+          + '<span title="thresholds from the indicator settings (Common 5. Speed)">FAST ≤' + sp.fast + 's · NORMAL ≤' + sp.normal + 's · SLOW ≤' + sp.slow + 's</span></div>';
+      }
       for (const s of st.setups || []) {
         if (!s.on && $('hideOff').checked && !s.problem) continue;
         const sn = 'S' + String(s.n).padStart(2, '0');
-        const chart = '<span class="chart">' + esc(st.instrument) + ' · ' + esc(st.brick) + '</span>';
+        const chart = '<span class="chart">' + esc(st.instrument) + ' · ' + esc(st.brick) + '</span>' + (st.speed ? spdBadge(st.speed) : '');
         const title = s.book + '  F1=' + s.f1 + (s.f2 ? '  F2=' + s.f2 : '') + (s.f3 ? '  F3=' + s.f3 : '');
         if (!s.on) { html += '<div class="card off"><div class="title">' + sn + ' ' + chart + ' ' + esc(title) + ' <span class="badge">OFF</span></div>'
           + (s.problem ? '<div class="stats">' + esc(s.problem) + '</div>' : '') + '</div>'; continue; }
@@ -254,10 +283,11 @@
     const r = (n, p) => Array.from({ length: n }, () => Math.random() < p ? '1' : '0').join('');
     const L = (name, pattern, s) => ({ name, pattern, bits: s.length, ones: [...s].filter(c => c === '1').length,
       pct: s ? (100 * [...s].filter(c => c === '1').length / s.length).toFixed(1) : '', roll: s ? (100 * [...s.slice(-20)].filter(c => c === '1').length / Math.min(20, s.length)).toFixed(1) : '', s });
-    const now = new Date(), ts = d => d.toISOString().slice(0, 19).replace('T', ' ');
+    const now = new Date(Date.now() - 47e3), ts = d => { const p = n => String(n).padStart(2, '0'); d = new Date(d);
+      return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds()); };
     const f1a = r(312, 0.35), f1b = r(150, 0.34), f2b = r(46, 0.4) + '1000';
     states['Renko_MultiRecorder_state.json'] = { recorder: 'Renko_MultiRecorder', written: ts(now), instrument: 'MNQ 12-26', brick: 'Renko 40',
-      last_brick: ts(now), since: '', history: 'back fill 640 bricks from 10-27 06:30:02; stopped: session start reached', rolling: 20, reset_on_new_session: true,
+      last_brick: ts(now), since: '', speed: { window: 10, n: 10, avg_s: 24.6, last_s: 11.0, label: 'FAST', fast: 30, normal: 90, slow: 300 }, history: 'back fill 640 bricks from 10-27 06:30:02; stopped: session start reached', rolling: 20, reset_on_new_session: true,
       setups: [
         { n: 1, book: 'MERGED', on: true, problem: '', f1: '10', f2: '01,10', f3: '', alert: '1000', layer: 2, money_next: false, alarm_now: false, last_alert: ts(new Date(now - 6e5)), alert_count: 3, lines: [L('F1', '10', f1a), L('F2', '01,10', r(120, 0.35) + '10000')] },
         { n: 2, book: 'MERGED', on: true, problem: '', f1: '100', f2: '01,10', f3: '', alert: '1000', layer: 2, money_next: true, alarm_now: true, last_alert: ts(now), alert_count: 1, lines: [L('F1', '100', f1b), L('F2', '01,10', f2b)] },
@@ -267,7 +297,7 @@
       ] };
     const old = JSON.parse(JSON.stringify(states['Renko_MultiRecorder_state.json']));
     old.recorder = 'Renko_MultiRecorder_NQ40'; old.instrument = 'NQ 12-26'; old.written = ts(new Date(now - 5.6e7)); old.last_brick = old.written;
-    old.setups = old.setups.slice(0, 2); states['Renko_MultiRecorder_NQ40_state.json'] = old;
+    old.setups = old.setups.slice(0, 2); old.speed = { window: 10, n: 10, avg_s: 412, last_s: 1290, label: 'SUPER SLOW', fast: 30, normal: 90, slow: 300 }; states['Renko_MultiRecorder_NQ40_state.json'] = old;
     $('intro').hidden = true; setStatus('DEMO data (open without ?demo for your real folder)'); render();
   }
 })();
