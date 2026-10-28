@@ -58,6 +58,11 @@
   .run b { color: var(--accent); }
   label.wrap { white-space: normal; }
   .chart { font-weight: 500; color: var(--muted); }
+  .rec-head .live, .live { font-size: 12px; font-weight: 700; padding: 1px 8px; border-radius: 999px; color: var(--panel) !important; background: var(--one); }
+  .rec-head .dead, .dead { font-size: 12px; font-weight: 700; padding: 1px 8px; border-radius: 999px; color: var(--off); border: 1px solid var(--line); }
+  details.notrun { margin: 26px 0 0; border-top: 1px dashed var(--line); padding-top: 10px; }
+  details.notrun > summary { cursor: pointer; color: var(--muted); font-weight: 600; }
+  details.notrun .rec { opacity: .7; }
   .spd { font-size: 12px; font-weight: 700; padding: 1px 8px; border-radius: 999px; letter-spacing: .3px; }
   .spd.FAST { color: var(--accent); background: var(--accent-bg); }
   .spd.NORMAL { color: var(--one); background: color-mix(in srgb, var(--one) 14%, transparent); }
@@ -81,7 +86,7 @@
   <label><input type="checkbox" id="beep"> beep in browser on new alert</label>
   <label>text size <button id="smaller" title="smaller">−</button><button id="bigger" title="bigger">+</button></label>
   <label><input type="checkbox" id="group" checked> groups of 10</label>
-  <label class="wrap" title="A file counts as old when NinjaTrader has not rewritten it for 60 minutes"><input type="checkbox" id="hideOld"> hide old files (not updated 60+ min) — or delete the old *_state.json in the Log folder</label>
+  <label class="wrap" title="Running recorders are always on top. Others are folded at the bottom; tick this to hide them completely."><input type="checkbox" id="hideOld"> hide recorders that are not running — or delete their *_state.json in the Log folder</label>
   <span id="status">No folder chosen yet.</span>
 </header>
 <main id="main">
@@ -90,6 +95,8 @@
     The page then re-reads every <code>*_state.json</code> in that folder every 1.5 seconds — no need to refresh.
     It only <i>reads</i> the files; NinjaTrader keeps writing whether this page is open or not.
     Use Chrome or Edge (Firefox cannot open folders).
+    <br><b>Rule:</b> every time you add or reload the indicator, give it a <b>new unique Log Base Name</b> that was never used before —
+    instrument-date-time, e.g. <code>MNQ10-28-2026-1PM</code> — and check that the <b>LIVE</b> header here shows that name.
   </div>
 </main>
 <footer>
@@ -99,20 +106,35 @@
       <li>Copy this file (<code>Renko_Recorder_Viewer.html</code>) anywhere you like — e.g. into the Log Folder (default <code>C:\temp</code>) so it sits next to the logs.</li>
       <li>Double-click it to open it in <b>Chrome or Edge</b>, click <b>Choose log folder</b> and pick the indicator's Log Folder. Next time, just click <b>Reconnect</b>.</li>
       <li>Leave it open — it re-reads every 1.5 s. NinjaTrader keeps writing whether this page is open or not.</li>
+      <li>Running recorders (green <b>LIVE</b>) are always on top. Recorders that are not running — removed, renamed, chart closed — are folded at the bottom.</li>
+      <li><b>The rule — a NEW, UNIQUE Log Base Name every time</b> you add or reload the indicator, and a different one on every chart.
+        Never reuse a name from an earlier run. Recommended: <b>instrument-date-time</b>, e.g. <code>MNQ10-28-2026-1PM</code>
+        (two charts at once: add the brick size, e.g. <code>MNQ40-10-28-2026-1PM</code> and <code>MNQ80-10-28-2026-1PM</code>).
+        <b>Remember the name</b> and check that the <b>LIVE</b> header on this page shows exactly that name — it is also the first line of the
+        chart's HUD (<code>&gt;&gt; name &lt;&lt;</code>) and the indicator's label on the chart (<code>Recorder: name</code>).
+        Then you are sure you are watching the indicator that is running now.
+        <br><i>Safety net if a name is reused by mistake:</i> a chart that reuses a name already running on a <i>different</i> chart
+        (e.g. MNQ and NQ, or MNQ 40 and MNQ 80) does not take over the file — its HUD shows <b>"!!!! NAME ALREADY USED"</b>;
+        reloading the <i>same</i> chart with the same name takes over (this page shows "restarted with the same name").</li>
       <li><b>Fresh start (optional):</b> delete the old files ending in <code>_state.json</code> from the Log Folder. Running recorders write a new one on their next brick. Keep the <code>.csv</code> files — they are your history.</li>
     </ol>
     <p>Each recorder writes <code>&lt;LogBaseName&gt;_state.json</code> after every brick. The line with a dark left edge is the deepest (money) layer.
     "0s in a row" = how many 0's follow the last 1 of that string.
     <b>Market speed</b> = average seconds per brick over the last N bricks of this session (set in the indicator, "Common 5. Speed");
-    "this brick open" counts up live from the last brick close.</p>
+    "this brick open" counts up live from the last brick close.
+    <b>Check it matches the chart:</b> the HUD line "state file … #N" on the chart and "update #N" here should show the same number.
+    If the HUD shows "!! STATE FILE NOT WRITTEN" or "!! ANOTHER chart also writes", fix that first. The chart's HUD shows only the
+    <i>last layer</i> (last 30 bits); this page shows every layer in full.</p>
   </div>
 </footer>
 
 <script>
 (() => {
   const $ = id => document.getElementById(id);
-  const POLL_MS = 1500, STALE_S = 180, OLD_S = 3600;
-  let dir = null, timer = null, lastText = {}, lastAlertCounts = {}, states = {};
+  const POLL_MS = 1500, STALE_S = 180;
+  let notrunOpen = false;
+  let dir = null, timer = null, lastText = {}, lastAlertCounts = {}, states = {}, polling = false;
+  const writers = {};   // file -> {id, changedAt, other} : detects two charts writing the same file
   let bitSize = 15, hiddenOld = 0;
   try { bitSize = +localStorage.getItem('rv_bits') || 15; } catch (e) {}
   try { $('hideOff').checked = localStorage.getItem('rv_hide') !== '0'; $('beep').checked = localStorage.getItem('rv_beep') === '1';
@@ -156,31 +178,60 @@
 
   function setStatus(t) { $('status').textContent = t; }
 
+  // Reads EVERY *_state.json on every poll and compares the TEXT (not the file date/size, which
+  // Windows does not always change when the file is swapped) -> a new brick always shows.
+  let pollStart = 0, lastChange = null;
+  const readErr = {};   // file -> {n, msg}: consecutive read/parse failures
   async function poll() {
     if (!dir) return;
+    if (polling && Date.now() - pollStart < 10000) return;   // one read at a time (a stuck read is dropped after 10 s)
+    polling = true; pollStart = Date.now();
     try {
       const seen = {};
-      for await (const [name, entry] of dir.entries()) {
-        if (entry.kind !== 'file' || !name.endsWith('_state.json')) continue;
-        seen[name] = true;
-        const f = await entry.getFile();
-        const key = name + ':' + f.lastModified + ':' + f.size;
-        if (lastText[name] === key) continue;
-        let txt;
-        try { txt = await f.text(); } catch (e) { continue; }            // being rewritten: try next poll
-        try { states[name] = JSON.parse(txt); lastText[name] = key; } catch (e) { /* half-written: next poll */ }
+      try {
+        for await (const [name, entry] of dir.entries()) {
+          if (entry.kind !== 'file' || !name.endsWith('_state.json')) continue;
+          seen[name] = true;
+          let txt;
+          try { txt = await (await entry.getFile()).text(); }
+          catch (e) { bump(name, 'cannot read the file right now (' + e.name + ')'); continue; }   // being swapped: next poll
+          if (lastText[name] === txt) { delete readErr[name]; continue; }                     // nothing new
+          let st;
+          try { st = JSON.parse(txt); }
+          catch (e) { bump(name, 'file is not complete/valid yet (' + e.message + ')'); continue; }
+          lastText[name] = txt; states[name] = st; delete readErr[name]; lastChange = new Date();
+          if (st.writer) {                              // writer id flips -> two charts share this file
+            // a new writer once = the indicator was restarted with the same name (fine);
+            // switching BACK to the previous writer within 3 min = two charts share this file (problem)
+            const w = writers[name];
+            if (!w) writers[name] = { id: st.writer, prev: '', restartAt: 0, clashAt: 0 };
+            else if (w.id !== st.writer) {
+              if (st.writer === w.prev && Date.now() - w.restartAt < 180000) w.clashAt = Date.now();
+              else w.restartAt = Date.now();
+              w.prev = w.id; w.id = st.writer;
+            }
+          }
+        }
+      } catch (e) {
+        setStatus('Lost access to the folder (' + e.message + '). Click Reconnect.'); clearInterval(timer); timer = null;
+        $('reconnect').hidden = false; return;
       }
-      for (const n of Object.keys(states)) if (!seen[n]) delete states[n];
-      checkAlerts(); render();
-      setStatus('Folder "' + dir.name + '" · ' + Object.keys(states).length + ' recorder(s)' + (hiddenOld ? ' (' + hiddenOld + ' old hidden)' : '') + ' · checked ' + new Date().toLocaleTimeString());
-    } catch (e) { setStatus('Lost access to the folder (' + e.message + '). Click Reconnect.'); clearInterval(timer); $('reconnect').hidden = false; }
+      for (const n of Object.keys(states)) if (!seen[n]) { delete states[n]; delete lastText[n]; }
+      try { checkAlerts(); render(); }
+      catch (e) { $('main').insertAdjacentHTML('afterbegin', '<div class="notice">Display error: ' + esc(e.message) + ' — the page keeps reading; please tell Claude this message.</div>'); }
+      setStatus('Folder "' + dir.name + '" · ' + Object.keys(states).length + ' recorder(s)' + (hiddenOld ? ' (' + hiddenOld + ' old hidden)' : '')
+        + ' · checked ' + new Date().toLocaleTimeString() + (lastChange ? ' · last new data ' + lastChange.toLocaleTimeString() : ''));
+    } finally { polling = false; }
   }
+  function bump(name, msg) { const r = readErr[name] || { n: 0 }; r.n++; r.msg = msg; readErr[name] = r; }
+  // a hidden browser tab is slowed down by Chrome; read again the moment it is shown
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
 
   function checkAlerts() {
     let fresh = false;
     for (const [file, st] of Object.entries(states))
       for (const s of st.setups || []) {
-        const k = file + '#' + s.n, c = s.alert_count || 0;
+        const k = file + '#' + (st.writer || '') + '#' + s.n, c = s.alert_count || 0;   // per run: a restart counts from 0 again
         if (k in lastAlertCounts && c > lastAlertCounts[k]) fresh = true;
         lastAlertCounts[k] = c;
       }
@@ -220,24 +271,48 @@
 
   function render() {
     const main = $('main'); const all = Object.keys(states).sort();
-    const isOld = f => { const a = ago(states[f].written); return a !== null && a > OLD_S; };
-    const files = $('hideOld').checked ? all.filter(f => !isOld(f)) : all;
-    hiddenOld = all.length - files.length;
-    if (!files.length && all.length) { main.innerHTML = '<div class="notice">All ' + all.length + ' state file(s) are old (not updated for 60+ min) and hidden. Untick "hide old files", or start the indicator in NinjaTrader.</div>'; return; }
-    if (!files.length) { if (dir) main.innerHTML = '<div class="notice">No <code>*_state.json</code> found in this folder yet. Is Indicator_Renko_MultiRecorder running with "Enable logs" ON and this Log Folder?</div>'; return; }
+    const info = {}; all.forEach(f => info[f] = runInfo(states[f]));
+    const live = all.filter(f => info[f].live), dead = all.filter(f => !info[f].live);
+    hiddenOld = $('hideOld').checked ? dead.length : 0;
+    if (!all.length) { if (dir) main.innerHTML = '<div class="notice">No <code>*_state.json</code> found in this folder yet. Is Indicator_Renko_MultiRecorder running with "Enable logs" ON and this Log Folder?</div>'; return; }
+    let html = section(live, info);
+    if (!live.length) html = '<div class="notice">No recorder is running right now' + (dead.length ? ' (' + dead.length + ' not running' + (hiddenOld ? ', hidden' : ', folded below') + ')' : '')
+      + '. Start the indicator in NinjaTrader, or check that its Log Folder is this folder.</div>' + html;
+    if (dead.length && !$('hideOld').checked) {
+      html += '<details class="notrun"' + (notrunOpen ? ' open' : '') + '><summary>Not running (' + dead.length + '): '
+        + dead.map(f => esc(states[f].recorder) + ' — ' + esc(info[f].why)).join(' · ') + '  (click to show; delete their _state.json in the Log folder to remove them)</summary>';
+      html += section(dead, info);
+      html += '</details>';
+    }
+    main.innerHTML = html;
+    const d = main.querySelector('details.notrun'); if (d) d.addEventListener('toggle', () => { notrunOpen = d.open; });
+  }
+
+  // one <section> per recorder file
+  function section(files, info) {
     let html = '';
     for (const f of files) {
       const st = states[f]; const age = ago(st.written);
-      html += '<section class="rec"><div class="rec-head"><h2>' + esc(st.recorder) + '</h2>'
+      const w = writers[f], clash = w && w.clashAt && Date.now() - w.clashAt < 180000;
+      const restarted = w && !clash && w.restartAt && Date.now() - w.restartAt < 300000;
+      html += '<section class="rec">' + (clash ? '<div class="notice">Two NinjaTrader charts are writing the same file <code>' + esc(f)
+          + '</code> (it keeps switching between them), so this section jumps between charts and will not match one chart\'s text. '
+          + 'Give each chart\'s recorder its own <b>Log Base Name</b>.</div>' : '')
+        + (readErr[f] && readErr[f].n >= 5 ? '<div class="notice">Showing older data: the last ' + readErr[f].n + ' reads failed — ' + esc(readErr[f].msg) + '.</div>' : '')
+        + '<div class="rec-head"><h2 title="Log Base Name = the name on the first line of the chart HUD (>> name <<) and the chart label (Recorder: name)">' + esc(st.recorder) + '</h2>'
+        + (info[f].live ? '<span class="live" title="saved by NinjaTrader within the last minute">LIVE</span>' : '<span class="dead">NOT RUNNING — ' + esc(info[f].why) + '</span>')
+        + (restarted ? '<span class="badge" title="a new copy of the indicator took over this name — use a new unique Log Base Name each time to avoid mix-ups">restarted with the same name ' + esc(hm(st.started || st.written)) + '</span>' : '')
+        + (st.starting && info[f].live ? '<span class="badge money">waiting for the first brick</span>' : '')
         + '<span>' + esc(st.instrument) + ' · ' + esc(st.brick) + '</span>'
         + '<span>last brick ' + esc(hm(st.last_brick)) + '</span>'
-        + '<span' + (age !== null && age > STALE_S ? ' class="stale"' : '') + '>file written ' + esc(hm(st.written))
-        + (age !== null && age > STALE_S ? ' (' + Math.round(age / 60) + ' min ago — slow market or NinjaTrader stopped?)' : '') + '</span>'
+        + (st.seq ? '<span title="same #number as the HUD line \'state file ... #N\' on the chart">update <b>#' + st.seq + '</b></span>' : '')
+        + '<span' + (!info[f].live ? ' class="stale"' : '') + '>file saved ' + esc(hm(st.written)) + '</span>'
         + '<span>' + esc(st.history) + (st.reset_on_new_session ? '' : ' · strings continue across sessions') + '</span></div>';
       const sp = st.speed;
       if (sp) {
-        // "this brick open for" = time since NinjaTrader last wrote the file (written right after each brick closed)
-        const open = age !== null && age >= 0 ? age : null;
+        // "this brick open for" = time since the last brick closed (PC clock); only while running
+        const bAge = ago(st.brick_saved || st.written);
+        const open = info[f].live && bAge !== null && bAge >= 0 ? bAge : null;
         html += '<div class="speedrow"><span>market speed</span>' + (sp.label ? spdBadge(sp)
             + '<span>avg <b>' + secs(sp.avg_s) + '</b> per brick over last <b>' + sp.n + '</b> bricks</span>'
             + '<span>last brick <b>' + secs(sp.last_s) + '</b></span>'
@@ -250,7 +325,7 @@
       for (const s of st.setups || []) {
         if (!s.on && $('hideOff').checked && !s.problem) continue;
         const sn = 'S' + String(s.n).padStart(2, '0');
-        const chart = '<span class="chart">' + esc(st.instrument) + ' · ' + esc(st.brick) + '</span>' + (st.speed ? spdBadge(st.speed) : '');
+        const chart = '<span class="chart">' + (files.length > 1 ? esc(st.recorder) + ' · ' : '') + esc(st.instrument) + ' · ' + esc(st.brick) + '</span>' + (st.speed ? spdBadge(st.speed) : '');
         const title = s.book + '  F1=' + s.f1 + (s.f2 ? '  F2=' + s.f2 : '') + (s.f3 ? '  F3=' + s.f3 : '');
         if (!s.on) { html += '<div class="card off"><div class="title">' + sn + ' ' + chart + ' ' + esc(title) + ' <span class="badge">OFF</span></div>'
           + (s.problem ? '<div class="stats">' + esc(s.problem) + '</div>' : '') + '</div>'; continue; }
@@ -275,7 +350,16 @@
       }
       html += '</section>';
     }
-    main.innerHTML = html;
+    return html;
+  }
+
+  // running = saved "running" flag + a fresh heartbeat (v1.4); older recorders: written in the last 3 min
+  function runInfo(st) {
+    const age = ago(st.written);
+    if (st.running === false) return { live: false, why: 'stopped at ' + hm(st.written) };
+    const lim = st.heartbeat_s ? Math.max(75, st.heartbeat_s * 3 + 15) : STALE_S;
+    if (age !== null && age <= lim) return { live: true, why: '' };
+    return { live: false, why: 'no update for ' + secs(age) + ' (NinjaTrader/chart closed or market closed)' };
   }
 
   // ---- demo mode (open the file with ?demo to see sample data) ----
@@ -283,11 +367,11 @@
     const r = (n, p) => Array.from({ length: n }, () => Math.random() < p ? '1' : '0').join('');
     const L = (name, pattern, s) => ({ name, pattern, bits: s.length, ones: [...s].filter(c => c === '1').length,
       pct: s ? (100 * [...s].filter(c => c === '1').length / s.length).toFixed(1) : '', roll: s ? (100 * [...s.slice(-20)].filter(c => c === '1').length / Math.min(20, s.length)).toFixed(1) : '', s });
-    const now = new Date(Date.now() - 47e3), ts = d => { const p = n => String(n).padStart(2, '0'); d = new Date(d);
+    const now = new Date(Date.now() - 5e3), ts = d => { const p = n => String(n).padStart(2, '0'); d = new Date(d);
       return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds()); };
     const f1a = r(312, 0.35), f1b = r(150, 0.34), f2b = r(46, 0.4) + '1000';
     states['Renko_MultiRecorder_state.json'] = { recorder: 'Renko_MultiRecorder', written: ts(now), instrument: 'MNQ 12-26', brick: 'Renko 40',
-      last_brick: ts(now), since: '', speed: { window: 10, n: 10, avg_s: 24.6, last_s: 11.0, label: 'FAST', fast: 30, normal: 90, slow: 300 }, history: 'back fill 640 bricks from 10-27 06:30:02; stopped: session start reached', rolling: 20, reset_on_new_session: true,
+      last_brick: ts(now), since: '', writer: 'a1b2c3d4', seq: 412, running: true, heartbeat_s: 20, brick_saved: ts(new Date(Date.now() - 47e3)), speed: { window: 10, n: 10, avg_s: 24.6, last_s: 11.0, label: 'FAST', fast: 30, normal: 90, slow: 300 }, history: 'back fill 640 bricks from 10-27 06:30:02; stopped: session start reached', rolling: 20, reset_on_new_session: true,
       setups: [
         { n: 1, book: 'MERGED', on: true, problem: '', f1: '10', f2: '01,10', f3: '', alert: '1000', layer: 2, money_next: false, alarm_now: false, last_alert: ts(new Date(now - 6e5)), alert_count: 3, lines: [L('F1', '10', f1a), L('F2', '01,10', r(120, 0.35) + '10000')] },
         { n: 2, book: 'MERGED', on: true, problem: '', f1: '100', f2: '01,10', f3: '', alert: '1000', layer: 2, money_next: true, alarm_now: true, last_alert: ts(now), alert_count: 1, lines: [L('F1', '100', f1b), L('F2', '01,10', f2b)] },

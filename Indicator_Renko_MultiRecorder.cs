@@ -21,6 +21,31 @@ public enum RecorderHudCorner { BottomLeft, BottomRight, TopLeft, TopRight, Cent
 // =============================================================================
 // Indicator_Renko_MultiRecorder  —  up to 10 Renko transit setups in ONE indicator (observer)
 // =============================================================================
+// v1.4 2026-10-28  (viewer support + same-name protection; the strings and alert rules are unchanged)
+//   * Same Log Base Name re-used (no unique name): the new copy saves a "starting" state the moment
+//     it starts, so the viewer never shows the old run's data or "stopped" for it; heartbeat from then on.
+//   * Alert text (Alerts window / Output) starts with the Log Base Name + instrument.
+//   * Same Log Base Name on TWO DIFFERENT charts (MNQ + NQ, or MNQ 40 + MNQ 80): the chart that
+//     started second does NOT overwrite the running one's state file; its HUD shows "!!!! NAME
+//     ALREADY USED ..." until it gets its own name (or the other recorder stops - then it takes over).
+//   * CSV log names include the chart (e.g. ..._MNQ_12-26_Renko_40_S01_...csv): never mixed.
+//   * The HUD's first line and the chart label show the Log Base Name (the recorder's name in the
+//     viewer), with a reminder to look for that name in Renko_Recorder_Viewer.html.
+//   * HEARTBEAT: while running, the state file is re-saved every 20 s even when no brick closes
+//     (only "written" changes; "seq" still counts bricks). The viewer can tell a RUNNING recorder
+//     from one that was removed/closed or from an old file left in the folder.
+//   * When the indicator is removed, reloaded or NinjaTrader closes, it saves "running": false.
+// v1.3 2026-10-28  (state-file reliability; no change to the strings, alerts or CSV logs)
+//   * State file is written to a per-chart temp file, then swapped in with File.Replace, with
+//     3 quick retries and a direct-write fallback (v1.2 used Delete + Move, which fails silently
+//     on Windows while the browser is reading the file -> the viewer kept showing old data).
+//   * Every write is checked. A failure is shown on the HUD ("!! STATE FILE NOT WRITTEN") and
+//     printed to the NinjaScript Output window (at most once a minute) instead of being hidden.
+//   * Each chart gets a writer id; if ANOTHER chart writes the same <LogBaseName>_state.json
+//     (same Log Base Name on two charts -> the viewer flips between them), the HUD warns.
+//   * HUD line "state file ... #N written HH:mm:ss" and the same #N in the viewer, so the two can
+//     be compared at a glance. New JSON fields: writer, seq, state_path.
+//   * After the swap the file's date is set to now (Windows can keep the old date on a replace).
 // v1.2 2026-10-28
 //   * MARKET SPEED: average seconds per brick over the last N closed bricks (default 10, never
 //     crosses the session start) + the last brick's seconds, labelled FAST / NORMAL / SLOW /
@@ -52,7 +77,7 @@ public enum RecorderHudCorner { BottomLeft, BottomRight, TopLeft, TopRight, Cent
 //   Alert  last-layer alert pattern, default 1000 (blank = no alert).
 //   Patterns: '0' '1', '?' = one-or-more 1s, '*' = one-or-more 0s, comma = OR, tail match.
 //   A pattern with any other character turns that slot OFF with a clear message in the
-//   NinjaScript Output window, in the log folder (<LogBaseName>_setup_check.txt) and on the HUD.
+//   NinjaScript Output window, in the log folder (<LogBaseName>_<chart>_setup_check.txt) and on the HUD.
 //
 // HOW THE STRINGS ARE BUILT (same as the single indicators)
 //   Brick bit: green (close rose) = 1, red (close fell) = 0; equal close repeats the last bit.
@@ -79,10 +104,10 @@ public enum RecorderHudCorner { BottomLeft, BottomRight, TopLeft, TopRight, Cent
 //   9:30-16:00 ET (= 6:30 AM - 1:00 PM PT). Outside the hours: no sound, text still updates.
 //
 // FILES (in Log Folder)
-//   <LogBaseName>_S<n>_<BOOK>_F1-<p>_F2-<p>_F3-<p>_<stamp>.csv   one per setup per enable
+//   <LogBaseName>_<chart>_S<n>_<BOOK>_F1-<p>_F2-<p>_F3-<p>_<stamp>.csv   one per setup per enable (chart e.g. MNQ_12-26_Renko_40)
 //      timestamp,brick_time,replay,side,bit,inF2,inF3,f1_pct,f1_roll,f2_pct,f2_roll,f3_pct,f3_roll,f1,f2,f3,alarm,trail0
 //   <LogBaseName>_state.json     current state of all setups (rewritten every brick)
-//   <LogBaseName>_setup_check.txt   what each slot was understood as (written on enable)
+//   <LogBaseName>_<chart>_setup_check.txt   what each slot was understood as (written on enable)
 //   ('*' is written as 'z', '?' as 'o', ',' as '_' in file names)
 // =============================================================================
 namespace NinjaTrader.NinjaScript.Indicators
@@ -130,6 +155,25 @@ namespace NinjaTrader.NinjaScript.Indicators
         private TimeZoneInfo nyZone = null;
         private const int MAX_LEN = 20000;          // keep at most this many bits per string (tail)
         private const string HUD_TAG = "Renko_MultiRecorder_HUD";
+        // state-file health (v1.3)
+        private readonly string writerId = Guid.NewGuid().ToString("N").Substring(0, 8);
+        private int      stateSeq = 0;
+        private DateTime stateLastOk = DateTime.MinValue;
+        private string   stateError = "";               // last write problem ("" = fine)
+        private string   stateOtherWriter = "";         // another chart writing the same file ("" = none)
+        private string   stateBlocked = "";             // name in use by a running recorder on another chart ("" = no)
+        private DateTime stateLastPrint = DateTime.MinValue;
+        // heartbeat (v1.4): the JSON of the last brick is kept; a heartbeat only refreshes "written"
+        private readonly object stateLock = new object();
+        private string   stateTemplate = null;          // last brick's JSON with the __WRITTEN__ / __RUNNING__ tokens
+        private DateTime lastStateSave = DateTime.MinValue;
+        private const int HEARTBEAT_SECONDS = 20;
+
+        // chart label / indicator list: show the recorder's name (= Log Base Name), as in the viewer
+        public override string DisplayName
+        {
+            get { return string.IsNullOrWhiteSpace(LogBaseName) ? Name : "Recorder: " + LogBaseName; }
+        }
 
         protected override void OnStateChange()
         {
@@ -186,8 +230,24 @@ namespace NinjaTrader.NinjaScript.Indicators
                     lifeStarted = true;
                     BuildSetups();
                     needReplay = true;      // first live brick: back fill (or seed) then live
+                    if (EnableLog) WriteStartState();   // claim the state file NOW (the strings follow at the first brick)
                 }
             }
+            else if (State == State.Terminated)
+            {
+                // removed / reloaded / NinjaTrader closing: tell the viewer this recorder stopped
+                // only if the file is still ours (a reloaded copy of this indicator may already own it)
+                if (lifeStarted && EnableLog && FileStillMine()) SaveState(false);
+            }
+        }
+
+        // Heartbeat: ticks keep arriving even when no brick closes; re-save every 20 s so the viewer
+        // knows this recorder is still running. Uses the last brick's data (no chart access here).
+        protected override void OnMarketData(MarketDataEventArgs e)
+        {
+            if (!lifeStarted || !EnableLog || stateTemplate == null) return;
+            if ((DateTime.Now - lastStateSave).TotalSeconds < HEARTBEAT_SECONDS) return;
+            SaveState(true);
         }
 
         // =====================================================================
@@ -222,7 +282,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                 try
                 {
                     if (!Directory.Exists(LogFolder)) Directory.CreateDirectory(LogFolder);
-                    File.WriteAllText(Path.Combine(LogFolder, LogBaseName + "_setup_check.txt"), sb.ToString());
+                    File.WriteAllText(Path.Combine(LogFolder, LogBaseName + "_" + ChartTag() + "_setup_check.txt"), sb.ToString());
                 }
                 catch { }
         }
@@ -416,7 +476,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             try
             {
                 if (!Directory.Exists(LogFolder)) Directory.CreateDirectory(LogFolder);
-                s.LogPath = Path.Combine(LogFolder, LogBaseName + "_S" + s.N.ToString("00") + "_" + s.Book
+                s.LogPath = Path.Combine(LogFolder, LogBaseName + "_" + ChartTag() + "_S" + s.N.ToString("00") + "_" + s.Book
                     + "_F1-" + Safe(s.P1) + "_F2-" + Safe(s.p2.Count > 0 ? s.P2 : "") + "_F3-" + Safe(s.p3.Count > 0 ? s.P3 : "")
                     + "_" + DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss") + ".csv");
                 File.AppendAllText(s.LogPath,
@@ -495,7 +555,9 @@ namespace NinjaTrader.NinjaScript.Indicators
             if (!s.AlarmNow) return;
             s.LastAlert = DateTime.Now; s.AlertCount++;
             bool sound = InAlertHours();
-            string msg = s.Label + ": F" + s.Layer + " ends with " + s.PA + " (" + s.LastAlert.ToString("HH:mm:ss") + ")";
+            // name + instrument first: with several charts the Alerts window shows which recorder it is
+            string msg = LogBaseName + " (" + (Instrument != null ? Instrument.FullName : "") + ") " + s.Label
+                       + ": F" + s.Layer + " ends with " + s.PA + " (" + s.LastAlert.ToString("HH:mm:ss") + ")";
             Print("[MultiRecorder] ALERT " + msg + (sound ? "" : "  (outside alert hours: no sound)"));
             Note(s, "# ALERT " + msg + (sound ? "" : " (no sound: outside hours)"));
             if (!sound) return;
@@ -504,7 +566,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                 string snd = AlertSoundFile ?? "";
                 if (snd.Length > 0 && !Path.IsPathRooted(snd))
                     snd = Path.Combine(NinjaTrader.Core.Globals.InstallDir, "sounds", snd);
-                Alert("MultiRecorder_S" + s.N + "_" + s.AlertCount, Priority.High, msg, snd, 0, Brushes.DarkOrange, Brushes.Black);
+                Alert("MultiRecorder_" + LogBaseName + "_" + writerId + "_S" + s.N + "_" + s.AlertCount, Priority.High, msg, snd, 0, Brushes.DarkOrange, Brushes.Black);
             }
             catch (Exception ex) { Print("[MultiRecorder] alert error: " + ex.Message); }
         }
@@ -563,9 +625,18 @@ namespace NinjaTrader.NinjaScript.Indicators
             try
             {
                 var ci = CultureInfo.InvariantCulture;
+                if (!Directory.Exists(LogFolder)) Directory.CreateDirectory(LogFolder);
+                string path = StatePath();
+                stateSeq++;
                 var sb = new StringBuilder();
                 sb.Append("{\"recorder\":").Append(J(LogBaseName))
-                  .Append(",\"written\":").Append(J(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", ci)))
+                  .Append(",\"writer\":").Append(J(writerId))
+                  .Append(",\"seq\":").Append(stateSeq)
+                  .Append(",\"state_path\":").Append(J(path))
+                  .Append(",\"written\":\"__WRITTEN__\"")
+                  .Append(",\"running\":__RUNNING__")
+                  .Append(",\"heartbeat_s\":").Append(HEARTBEAT_SECONDS)
+                  .Append(",\"brick_saved\":").Append(J(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", ci)))   // PC clock at this brick
                   .Append(",\"instrument\":").Append(J(Instrument != null ? Instrument.FullName : ""))
                   .Append(",\"brick\":").Append(J(BarsPeriod != null ? BarsPeriod.ToString() : ""))
                   .Append(",\"last_brick\":").Append(J(Time[0].ToString("yyyy-MM-dd HH:mm:ss", ci)))
@@ -607,22 +678,192 @@ namespace NinjaTrader.NinjaScript.Indicators
                     sb.Append("]}");
                 }
                 sb.Append("]}");
-                string path = Path.Combine(LogFolder, LogBaseName + "_state.json"), tmp = path + ".tmp";
-                File.WriteAllText(tmp, sb.ToString());
-                if (File.Exists(path)) File.Delete(path);
-                File.Move(tmp, path);
+                lock (stateLock) { stateTemplate = sb.ToString(); }
+                SaveState(true);
             }
-            catch { /* the viewer simply keeps the previous state until the next brick */ }
+            catch (Exception ex) { StateProblem("could not build the state file: " + ex.Message); }
+        }
+
+        // short, file-name-safe chart tag, e.g. "MNQ_12-26_Renko_40": CSV logs of two charts never mix,
+        // even when both use the same Log Base Name and start in the same second (workspace load)
+        private string ChartTag()
+        {
+            string t = (Instrument != null ? Instrument.FullName : "") + "_" + (BarsPeriod != null ? BarsPeriod.ToString() : "");
+            var sb = new StringBuilder();
+            foreach (char c in t) sb.Append(char.IsLetterOrDigit(c) || c == '-' ? c : '_');
+            return System.Text.RegularExpressions.Regex.Replace(sb.ToString(), "_+", "_").Trim('_');
+        }
+
+        private string StatePath() { return Path.Combine(LogFolder, LogBaseName + "_state.json"); }
+
+        // Saved the moment the indicator starts, before any brick: the viewer shows this recorder as
+        // LIVE ("waiting for the first brick") instead of the old file's data/"stopped" - also when the
+        // same Log Base Name is reused. Replaced by the full state at the first brick close.
+        private void WriteStartState()
+        {
+            try
+            {
+                if (!Directory.Exists(LogFolder)) Directory.CreateDirectory(LogFolder);
+                var ci = CultureInfo.InvariantCulture;
+                string now = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", ci);
+                var sb = new StringBuilder();
+                sb.Append("{\"recorder\":").Append(J(LogBaseName))
+                  .Append(",\"writer\":").Append(J(writerId))
+                  .Append(",\"seq\":0")
+                  .Append(",\"state_path\":").Append(J(StatePath()))
+                  .Append(",\"written\":\"__WRITTEN__\"")
+                  .Append(",\"running\":__RUNNING__")
+                  .Append(",\"heartbeat_s\":").Append(HEARTBEAT_SECONDS)
+                  .Append(",\"starting\":true")
+                  .Append(",\"started\":").Append(J(now))
+                  .Append(",\"brick_saved\":").Append(J(now))
+                  .Append(",\"instrument\":").Append(J(Instrument != null ? Instrument.FullName : ""))
+                  .Append(",\"brick\":").Append(J(BarsPeriod != null ? BarsPeriod.ToString() : ""))
+                  .Append(",\"last_brick\":\"\"")
+                  .Append(",\"history\":").Append(J("started " + DateTime.Now.ToString("HH:mm:ss") + " - waiting for the first brick to close (back fill + strings appear then)"))
+                  .Append(",\"rolling\":").Append(RollingWindowBits)
+                  .Append(",\"reset_on_new_session\":").Append(ResetOnNewSession ? "true" : "false")
+                  .Append(",\"setups\":[]}");
+                lock (stateLock) { stateTemplate = sb.ToString(); }
+                SaveState(true);
+            }
+            catch (Exception ex) { StateProblem("could not write the start state: " + ex.Message); }
+        }
+
+        private bool FileStillMine()
+        {
+            try
+            {
+                string path = StatePath();
+                if (!File.Exists(path)) return false;
+                return File.ReadAllText(path).Contains("\"writer\":\"" + writerId + "\"");
+            }
+            catch { return false; }
+        }
+
+        // Fill in the time + running flag and save (brick close, heartbeat, or stop).
+        private void SaveState(bool running)
+        {
+            lock (stateLock)
+            {
+                if (stateTemplate == null) return;
+                try
+                {
+                    string json = stateTemplate
+                        .Replace("\"__WRITTEN__\"", "\"" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) + "\"")
+                        .Replace("__RUNNING__", running ? "true" : "false");
+                    lastStateSave = DateTime.Now;
+                    SaveStateFile(StatePath(), json);
+                }
+                catch (Exception ex) { StateProblem("could not save the state file: " + ex.Message); }
+            }
+        }
+
+        // Swap the new state in. File.Replace is atomic on the same disk; a reader (the browser) that
+        // has the old file open only briefly can make it fail, so retry 3x, then write directly.
+        private void SaveStateFile(string path, string json)
+        {
+            if (!CheckOtherWriter(path)) return;           // name in use by a recorder on another chart
+            string tmp = path + "." + writerId + ".tmp";   // per chart: two charts never share a temp file
+            string err = "";
+            try { File.WriteAllText(tmp, json); }
+            catch (Exception ex) { StateProblem("temp file not written (" + ex.Message + ")"); return; }
+            for (int a = 0; a < 3; a++)
+            {
+                try
+                {
+                    if (File.Exists(path)) File.Replace(tmp, path, null, true);
+                    else File.Move(tmp, path);
+                    try { File.SetLastWriteTime(path, DateTime.Now); } catch { }   // make sure the file date moves on
+                    StateOk(); return;
+                }
+                catch (Exception ex) { err = ex.Message; System.Threading.Thread.Sleep(15); }
+            }
+            try { File.WriteAllText(path, json); StateOk(); }              // fallback: direct overwrite
+            catch (Exception ex) { StateProblem("state file locked/blocked (" + err + " / " + ex.Message + ")"); }
+            try { if (File.Exists(tmp)) File.Delete(tmp); } catch { }
+        }
+
+        // Who owns <LogBaseName>_state.json right now?  Returns false = do NOT write (name in use).
+        //  * no file / our own file / previous owner stopped (running:false) or silent > 75 s -> write
+        //  * a RUNNING recorder on ANOTHER chart (different instrument or brick size) owns it -> BLOCK:
+        //    keep its file intact, warn on this chart's HUD, and re-check at every heartbeat/brick
+        //    (if that recorder stops, this one takes the name over by itself)
+        //  * a running recorder on the SAME instrument + brick size = a reload of this chart (the new
+        //    copy may start before the old one is gone) -> take over; if the old one keeps writing
+        //    too (two identical charts), both HUDs show the "ANOTHER chart also writes" warning.
+        private bool CheckOtherWriter(string path)
+        {
+            try
+            {
+                if (!File.Exists(path)) { stateOtherWriter = ""; stateBlocked = ""; return true; }
+                string old = File.ReadAllText(path);
+                var m = System.Text.RegularExpressions.Regex.Match(old, "\"writer\":\"([0-9a-f]+)\"");
+                if (!m.Success || m.Groups[1].Value == writerId) { stateOtherWriter = ""; stateBlocked = ""; return true; }
+
+                string inst  = RxVal(old, "instrument"), brick = RxVal(old, "brick");
+                string mine  = (Instrument != null ? Instrument.FullName : "") + "|" + (BarsPeriod != null ? BarsPeriod.ToString() : "");
+                bool running = !old.Contains("\"running\":false");
+                DateTime wr;
+                bool fresh = DateTime.TryParseExact(RxVal(old, "written"), "yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture,
+                                                    DateTimeStyles.None, out wr)
+                             && (DateTime.Now - wr).TotalSeconds <= 75;
+                string who = inst + " " + brick;
+
+                if (running && fresh && (inst + "|" + brick) != mine)
+                {
+                    stateBlocked = "NAME ALREADY USED by the running recorder on " + who + " -> this chart is NOT shown in the viewer."
+                                 + " Give this chart its own Log Base Name.";
+                    if ((DateTime.Now - stateLastPrint).TotalSeconds > 60)
+                    { stateLastPrint = DateTime.Now; Print("[MultiRecorder] " + LogBaseName + ": " + stateBlocked); }
+                    return false;
+                }
+                stateBlocked = "";
+                if (stateLastOk != DateTime.MinValue && running && fresh)      // someone overwrote MY earlier file
+                {
+                    stateOtherWriter = "ANOTHER chart (" + who + ") also writes " + Path.GetFileName(path) + " - give each chart its own Log Base Name";
+                    if ((DateTime.Now - stateLastPrint).TotalSeconds > 60)
+                    { stateLastPrint = DateTime.Now; Print("[MultiRecorder] WARNING: " + stateOtherWriter); }
+                }
+                return true;
+            }
+            catch { return true; /* the browser may be reading it right now; write anyway */ }
+        }
+
+        private static string RxVal(string json, string key)
+        {
+            var m = System.Text.RegularExpressions.Regex.Match(json, "\"" + key + "\":\"([^\"]*)\"");
+            return m.Success ? m.Groups[1].Value : "";
+        }
+
+        private void StateOk() { stateLastOk = DateTime.Now; stateError = ""; }
+
+        private void StateProblem(string why)
+        {
+            stateError = why;
+            if ((DateTime.Now - stateLastPrint).TotalSeconds > 60)
+            { stateLastPrint = DateTime.Now; Print("[MultiRecorder] STATE FILE NOT WRITTEN: " + why + "  path=" + StatePath()); }
         }
 
         // ── compact HUD: one line per setup ──────────────────────────────────
         private void UpdateHud()
         {
             var sb = new StringBuilder();
-            sb.Append("RENKO MULTI-RECORDER   ").Append(historyNote)
-              .Append("   updated ").Append(DateTime.Now.ToString("HH:mm:ss"))
+            // 1st line = this recorder's name (= Log Base Name) - the same name heads its section in the viewer
+            sb.Append(">> ").Append(LogBaseName).Append(" <<   look for this name (LIVE) in Renko_Recorder_Viewer.html")
               .Append(Environment.NewLine)
-              .Append("(short version: last " + HudTailBits + " bits per setup - full strings in Renko_Recorder_Viewer.html)");
+              .Append(historyNote).Append("   updated ").Append(DateTime.Now.ToString("HH:mm:ss"))
+              .Append(Environment.NewLine)
+              .Append("(short version: last " + HudTailBits + " bits of the last layer per setup - full strings in the viewer)");
+            if (!EnableLog) sb.Append(Environment.NewLine).Append("state file OFF ('Enable logs' is off) - the browser viewer gets nothing");
+            else
+            {
+                sb.Append(Environment.NewLine).Append("state file " + StatePath() + "   #" + stateSeq
+                    + (stateLastOk != DateTime.MinValue ? "  written " + stateLastOk.ToString("HH:mm:ss") : ""));
+                if (stateError.Length > 0) sb.Append(Environment.NewLine).Append("!! STATE FILE NOT WRITTEN: " + stateError);
+                if (stateBlocked.Length > 0) sb.Append(Environment.NewLine).Append("!!!! " + stateBlocked);
+                if (stateOtherWriter.Length > 0) sb.Append(Environment.NewLine).Append("!! " + stateOtherWriter);
+            }
             double spAvg, spLast; int spN;
             sb.Append(Environment.NewLine).Append(CalcSpeed(out spAvg, out spLast, out spN)
                 ? "SPEED: " + SpeedLabel(spAvg) + "   avg " + Secs(spAvg) + " per brick over last " + spN + " bricks   (last brick " + Secs(spLast) + ")"
@@ -847,7 +1088,10 @@ namespace NinjaTrader.NinjaScript.Indicators
         [Display(Name="Log Folder", Order=2, GroupName="Common 3. Files")]
         public string LogFolder { get; set; }
 
-        [Display(Name="Log Base Name (use a different one per chart)", Order=3, GroupName="Common 3. Files")]
+        [Display(Name="Log Base Name = recorder name - NEW UNIQUE name every time (instrument-date-time, e.g. MNQ10-28-2026-1PM)", Order=3, GroupName="Common 3. Files",
+            Description="Never reuse a name from an earlier run or another chart. Recommended: instrument-date-time, e.g. MNQ10-28-2026-1PM "
+                      + "(add the brick size if you run two, e.g. MNQ40-10-28-2026-1PM). Shown on the HUD's first line, as the chart label "
+                      + "and as the section name in Renko_Recorder_Viewer.html.")]
         public string LogBaseName { get; set; }
 
         [Display(Name="Alert sound file (in NinjaTrader 'sounds' folder, or full path; blank = silent)", Order=1, GroupName="Common 4. Alert")]
