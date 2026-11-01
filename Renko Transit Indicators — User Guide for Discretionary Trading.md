@@ -1,5 +1,10 @@
 # Renko Transit Indicators — User Guide for Discretionary Trading
 
+|  |  |  |
+| --- | --- | --- |
+|  |  |  |
+|  |  |  |
+
 Oct 27, 2026 · @Albert Feng
 
 ## Purpose and honest expectations
@@ -11,7 +16,7 @@ What the research says, so the tools are used with the right expectations:
 - Across Jul–Oct and Apr–May 2026 MNQ data, the outcome strings behave close to a coin flip at the payoff's break-even rate. No F1/F2/F3 rule beat costs reliably on new data.
 - A pattern such as `1000` (a win, then three losses) does not by itself predict the next bit. The alert means "look now", not "trade now".
 - Your judgment (news, the open, the day's direction, how price is moving right now) is the part that might add an edge. The indicators help you find the moments to apply it and keep an honest record.
-- Measure your discretionary trades against the setup's base win rate (about 33% for a 2-brick target, 25% for 3 bricks), never against 50%.
+- Measure your discretionary trades against the setup's base win rate (about 33% for a 2-brick target, 25% for 3 bricks; about 67% for a continuation setup with a 1-brick target and 2-brick stop), never against 50%.
 
 ## The tools and when to use each
 
@@ -34,8 +39,8 @@ The trading strategies come as one file per layer; the indicators are one file e
 |  | Strategy files (trade) | Indicators (observe) |
 | --- | --- | --- |
 | MERGED | `Renko_mergedTransit_Layer1`, `_Layer2`, `_Layer3` — a separate file per layer | `Indicator_Renko_mergedLayer3` (or a MERGED slot in the multi-recorder) |
-| LONG / SHORT | Single-book files per layer (Layer 1, Layer 2) | `Indicator_Renko_LONGLayer3` / `_SHORTLayer3` (or a LONG / SHORT slot) |
-| How the layer is chosen | By which file you enable | F2 and F3 blank = Layer 1; F3 blank = Layer 2; all three set = Layer 3 |
+| LONG / SHORT | Single-book files per layer (Layer 1, Layer 2, Layer 3) | `Indicator_Renko_LONGLayer3` / `_SHORTLayer3` (or a LONG / SHORT slot) |
+| How the layer is chosen | By which file you enable; in a Layer 3 file F3 blank = Layer 2. A blank F2 in a strategy means never trade (unlike the indicators) | F2 and F3 blank = Layer 1; F3 blank = Layer 2; all three set = Layer 3 |
 
 **To make the indicator show exactly what a strategy holds:**
 
@@ -43,7 +48,35 @@ The trading strategies come as one file per layer; the indicators are one file e
 2. Same brick size on the same instrument.
 3. Same history settings: back fill on enable and the session reset ("Restart clean on new session" / "Reset strings on new session").
 
-Then the indicator's deepest string matches the strategy's money string bit for bit, and its `MONEY NEXT` tag shows when the strategy would place its next real order (subject to the strategy's own trading hours, open-position and safety rules).
+Then the indicator's deepest string matches the strategy's theoretical money string (its filter result) bit for bit, and its `MONEY NEXT` tag shows when the strategy would place its next real order (subject to the strategy's own trading hours, open-position and safety rules).
+
+## Theory string vs. real money string
+
+The last-layer money line in the indicators and the viewer is a theoretical filter result; the qty rule, exit pattern and breaker of a strategy read a different string — the real money trades.
+
+| String | What it holds | Where you see it | Read by |
+| --- | --- | --- | --- |
+| **Filtered (theory) money string** — the deepest line, e.g. `F2 = money` | Every signal that passed F1 / F2 (/ F3), scored by the next brick (1 = would-be win), whether or not a trade happened | Indicators, the viewer, the recorder's CSV logs. In the strategy logs mostly **not**: the LONG/SHORT Layer 2 CSV has no such column, and in the LONG/SHORT Layer 3 file the `filter2Outcome` column stays empty when F3 is blank; only the merged files print it (`f2out` lines in the log) | You, to judge the setup; F3 (if set) |
+| **Real money string** — `realTradeOutcome` in the strategy log | Only the trades the strategy actually filled: 1 = more contracts hit the target than the stop, 0 = otherwise | Strategy CSV / log, `real=` on each `TRADE CLOSED` line | **Qty rule** and **exit pattern** (and the **breaker**, which counts its 0's in a row) |
+
+**Which strings each strategy log shows.** The qty rule, exit pattern and breaker use **only the real money string** in all three strategies; the theory strings in a log are there for you to read (and, when F3 is set, to arm F3).
+
+| String | Merged log | LONG / SHORT log |
+| --- | --- | --- |
+| F1 outcome (theory, Layer 1) | yes — `f1out=` | yes — column `filter1Outcome` |
+| Last-layer outcome (theory, F2) | **yes** — `f2out=` | **only Layer 3 with F3 set** (`filter2Outcome`); Layer 2, or Layer 3 with F3 blank: **no** |
+| Real money trades — **used by the qty rule, exit pattern, breaker** | yes — `real=` on each `TRADE CLOSED`, `[QTY] sessionReal=` | yes — column `realTradeOutcome` |
+
+**When the two agree.** Only when every signal the filter allows really becomes a filled trade, and the stop and target match the brick geometry: transit (F1 ends in 0) = stop 1 brick, target 2 bricks; continuation (F1 ends in 1) = stop 2 bricks, target 1 brick.
+
+**Why they differ in real trading.**
+
+- **Signals not traded** (the theory string gets an extra bit): a position still open (busy), outside trading hours, margin cutoff, a trend/speed gate, the qty rule returned 0, the strategy already stopped by the exit pattern or breaker, real orders off, or the strategy enabled after the signal brick closed.
+- **Fills:** the target touched but not filled and the trade later lost (theory 1, real 0); several contracts with more stopped than filled at the target (majority rule, real 0); stop slippage costs money but does not change the bit.
+- **Different start:** the viewer includes history from before the strategy was enabled.
+- **Time window:** the qty rule reads today's real trades in all files; the exit pattern reads today's real trades in LONG/SHORT, but every real trade since enable in the merged files.
+
+**In practice.** Use the theory line to decide when to run a strategy; judge your money, size and stops by the real string. A run of 0's on the viewer is not the same as real losses in a row — the qty rule and breaker count only the real ones. The strategy log says why a signal was not traded (`[OUTSIDE HOURS]`, `skipped (busy)`, `[QTY SKIP]`) and how each trade scored (`winQty` / `lossQty` on `TRADE CLOSED`).
 
 ## How the strings are built
 
@@ -90,7 +123,7 @@ A viewer line looks like this:
 | `ALARMING NOW 10:42:13` | The deepest string just ended with the alert pattern (default `1000`); one sound was played |
 | `last alert 10:42:13` | When the alert last fired; stays so you can read it later |
 
-In the viewer, 1s are green and grouped by 10 counted from the newest bit, an alarming setup gets an orange frame, and a section header turns yellow if its file has not been updated for 3 minutes (slow market, or NinjaTrader stopped).
+In the viewer, 1s are green and grouped by 10 counted from the newest bit, an alarming setup gets an orange frame, running recorders carry a green LIVE badge and sit on top, and recorders that are not running (removed, reloaded, NinjaTrader closed, or no ticks for about 75 seconds, e.g. the daily break) are folded at the bottom with the reason. Each header also shows the update number (the same #N as the HUD line "state file … #N") and a market-speed row (FAST / NORMAL / SLOW / SUPER SLOW, average seconds per brick, and how long the current brick has been open).
 
 The chart HUD shows the same items on one short line per setup (last 30 bits).
 
@@ -156,7 +189,7 @@ You decide when the market suits the setup; the strategy file does the rest by r
 2. **Enable the matching strategy file** with the same book and patterns you were watching (Layer 1, 2 or 3 file), flat size, stop and target in the strategy.
 3. **Hand off.** The strategy takes every money transit by its rules, with a server-side bracket on each entry and its safety guards (naked-position guard, fast-market rescue, margin-cutoff flatten).
 4. **Let the exit rules end the run.** Set them before you enable, so the strategy switches itself off:
-   - **Trade-outcome exit pattern** on today's real results, e.g. `111` = stop after three real wins in a row (lock in a good run).
+   - **Trade-outcome exit pattern** on the real money string (today's real trades in LONG/SHORT; every real trade since enable in the merged files), e.g. `111` = stop after three real wins in a row (lock in a good run).
    - **Max real losses in a row**, e.g. 3 = stop after three straight real losses (cap the bad run).
    - **Trading hours / strategy life** so it never runs into hours you did not choose.
 5. **Review afterwards** from the strategy's log: trades, win rate against the base rate, and which exit rule ended it.
@@ -171,6 +204,7 @@ Trade flat size, put the stop in with every entry, and judge yourself against th
 | --- | --- | --- |
 | Stop 1 brick, target 2 bricks | 33.3% | The next brick decides the trade |
 | Stop 1 brick, target 3 bricks | 25.0% | Needs two bricks your way before one against |
+| Stop 2 bricks, target 1 brick (continuation: F1 ends in 1) | 66.7% | The next brick decides the trade; see the separate Renko Continuation Guide — by Current Code |
 
 Costs (commission plus slippage, about 0.5–1 point per MNQ trade) raise these: a 2-brick target on 40-tick bricks needs about 38% to break even.
 
@@ -190,8 +224,8 @@ The multi-recorder works out of the box: add it to the Renko chart, click OK, op
 
 1. Open the MNQ Renko chart (e.g. 40-tick or 80-tick) with the multi-recorder on it.
 2. Open `Renko_Recorder_Viewer.html` (kept in `Documents\NinjaTrader 8\RenkoTools\`) in Chrome or Edge and click Reconnect.
-3. Check each section header: instrument, brick size, last brick time, and the back fill note.
-4. Check the NinjaScript Output window or `<LogBaseName>_setup_check.txt` for any setup turned OFF by a typo.
+3. Check that the LIVE section header shows the exact Log Base Name you gave this run (also the first line of the chart HUD and the chart label "Recorder: name"), then its instrument, brick size, last brick time and back fill note.
+4. Check the NinjaScript Output window or `<LogBaseName>_<chart>_setup_check.txt` for any setup turned OFF by a typo.
 
 **Default setups** (all with F2 = `01,10`, F3 blank, alert `1000`)
 
@@ -212,23 +246,26 @@ The multi-recorder works out of the box: add it to the Renko chart, click OK, op
 | Reset strings on new session | ON | OFF = strings continue across sessions |
 | Show HUD / last N bits / font | ON / 30 / 12 | The short on-chart version |
 | Rolling window | 20 bits | Sets the "last N" percentage |
-| Log Folder / Log Base Name | `C:\temp` / `Renko_MultiRecorder` | Use a different base name on each chart (e.g. `MNQ40_Recorder`, `MNQ80_Recorder`) |
+| Log Folder / Log Base Name | `C:\temp` / `Renko_MultiRecorder` | **A new unique name every time** you add or reload the indicator, one per chart: instrument-date-time, e.g. `MNQ10-28-2026-1PM` (two charts: `MNQ40-10-28-2026-1PM`, `MNQ80-10-28-2026-1PM`). It heads the LIVE section in the viewer, the first line of the HUD and the chart label |
 | Alert sound file | `Alert2.wav` | In NinjaTrader's sounds folder; blank = silent |
 | Alert hours (New York time, ET) | 9:30–16:00 ET (6:30 AM–1:00 PM PT) | No sound outside; the text still updates |
 
 **Files in the log folder**
 
-- `<LogBaseName>_S01_MERGED_F1-10_F2-01_10_F3-off_<date-time>.csv` — one per setup per enable: every outcome with full strings (back-fill rows marked `replay=1`), resets and alerts noted.
+- `<LogBaseName>_<chart>_S01_MERGED_F1-10_F2-01_10_F3-off_<date-time>.csv` — one per setup per enable: every outcome with full strings (back-fill rows marked `replay=1`), resets and alerts noted.
 - `<LogBaseName>_state.json` — the live state, rewritten after every brick; read by the viewer.
-- `<LogBaseName>_setup_check.txt` — how each slot was understood.
+- `<LogBaseName>_<chart>_setup_check.txt` — how each slot was understood.
 
 **Troubleshooting**
 
 | Symptom | Check |
 | --- | --- |
 | Viewer shows nothing | Same folder as the recorder's Log Folder; "Enable logs" ON; Chrome or Edge, not Firefox |
-| Viewer jumps between two charts' data | Two recorders share a Log Base Name: give each its own |
-| Header yellow, "min ago" | NinjaTrader stopped or the market is slow; an old recorder's file can be deleted |
+| Viewer jumps between two charts' data | Two recorders share a Log Base Name: give each run and each chart its own new name |
+| Recorder shows NOT RUNNING | "stopped at" = removed, reloaded or NinjaTrader closed; "no update for" = no ticks (daily break, disconnect) — it turns LIVE again by itself. An old run's \_state.json can be deleted |
 | A setup shows OFF | A typo in a pattern: only `0 1 * ?` and commas are allowed |
 | No alert sound | Outside alert hours, sound file blank or missing, or Windows volume |
 | New defaults not showing | Remove and re-add the indicator; re-save any old template |
+| HUD: "!!!! NAME ALREADY USED" | Another chart (other instrument or brick size) already runs a recorder with this name; this chart stays out of the viewer until it gets its own name |
+| HUD: "!! STATE FILE NOT WRITTEN" | The Log Folder is missing or locked; the reason is on the HUD and in the NinjaScript Output window |
+| Viewer money line differs from the strategy's real results | Expected at times: see "Theory string vs. real money string" (skipped signals, fills, start time) |

@@ -139,8 +139,21 @@ Book **LONG**, F1 `01`, F2 `01,10`, F3 blank — on the **same chart**.
 * **The filter (F1, F2, F3) decides WHEN to trade** — it is theoretical, made of would-be trades.
 * **The qty rule, exit pattern and breaker decide HOW MUCH and WHEN TO STOP** — they read only real trades.
 * Convention everywhere: **1 = win (money gained), 0 = loss.**
-* LONG/SHORT Layer 3 with F3 blank do **not** fill the `filter2Outcome` column in the CSV (it stays
-  empty); the real string is in the `realTradeOutcome` column. The merged Layer 3 fills it either way.
+
+### Which strings each strategy log shows
+
+The qty rule, exit pattern and breaker use **only the real money string** in all three strategies —
+even where the log also prints the theory strings. The theory strings in a log are there for you to
+read (and, when F3 is set, to arm F3).
+
+| String | Merged log | LONG / SHORT log |
+|---|---|---|
+| F1 outcome (theory, Layer 1) | yes — `f1out=` | yes — column `filter1Outcome` |
+| Last-layer outcome (theory, F2) | **yes** — `f2out=` | **only Layer 3 with F3 set** (`filter2Outcome`); Layer 2, or Layer 3 with F3 blank: **no** (column missing or empty) |
+| Real money trades — **used by the qty rule, exit pattern, breaker** | yes — `real=` on each `TRADE CLOSED`, `[QTY] sessionReal=` | yes — column `realTradeOutcome` |
+
+So to check your qty rule or exit, always look at the real money string: the `realTradeOutcome`
+column in LONG/SHORT, the `real=` lines in merged.
 
 ---
 
