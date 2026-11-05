@@ -21,6 +21,13 @@ public enum RecorderHudCorner { BottomLeft, BottomRight, TopLeft, TopRight, Cent
 // =============================================================================
 // Indicator_Renko_MultiRecorder  —  up to 10 Renko transit setups in ONE indicator (observer)
 // =============================================================================
+// v1.5 2026-11-05  (alerts only; the strings are unchanged)
+//   * Up to THREE separate alerts per setup on the last layer: Alert 1 (default 1000), Alert 2 and
+//     Alert 3 (default blank). Each has its own pattern, count and time, and is reported by name
+//     (A1 / A2 / A3). A comma INSIDE one alert box is still OR; separate boxes = separate alerts.
+//   * Sound per alert NUMBER, for the whole indicator: "Sound for Alert 1" ON, Alert 2 / 3 OFF by
+//     default. A silent alert still shows on the HUD, in the viewer and in the log.
+//   * At most ONE sound per brick (several alerts on the same brick -> one sound).
 // v1.4 2026-10-28  (viewer support + same-name protection; the strings and alert rules are unchanged)
 //   * Same Log Base Name re-used (no unique name): the new copy saves a "starting" state the moment
 //     it starts, so the viewer never shows the old run's data or "stopped" for it; heartbeat from then on.
@@ -125,7 +132,8 @@ namespace NinjaTrader.NinjaScript.Indicators
             public readonly StringBuilder RawL = new StringBuilder(), RawS = new StringBuilder();
             public readonly StringBuilder F1 = new StringBuilder(), F2 = new StringBuilder(), F3 = new StringBuilder();
             public bool WaitL, WaitS, A2, A3;
-            public bool AlarmNow; public DateTime LastAlert = DateTime.MinValue; public int AlertCount;
+            public bool AlarmNow; public DateTime LastAlert = DateTime.MinValue; public int AlertCount;   // any alert
+            public readonly List<AlertSlot> Alerts = new List<AlertSlot>();                         // A1..A3 that are set
             public string LogPath;
             public int Layer { get { return p3.Count > 0 ? 3 : p2.Count > 0 ? 2 : 1; } }
             public StringBuilder Deepest { get { return p3.Count > 0 ? F3 : p2.Count > 0 ? F2 : F1; } }
@@ -141,8 +149,24 @@ namespace NinjaTrader.NinjaScript.Indicators
             {
                 RawL.Clear(); RawS.Clear(); F1.Clear(); F2.Clear(); F3.Clear();
                 WaitL = WaitS = A2 = A3 = false; AlarmNow = false;
+                foreach (AlertSlot a in Alerts) a.Now = false;
+            }
+            public string AlertsText()
+            {
+                var t = new List<string>();
+                foreach (AlertSlot a in Alerts) t.Add("A" + a.K + "=" + a.P);
+                return t.Count > 0 ? string.Join(" ", t) : "none";
             }
         }
+
+        // one alert of a setup (A1 / A2 / A3): own pattern, state, count and time
+        private class AlertSlot
+        {
+            public int K; public string P;
+            public readonly List<string> pats = new List<string>();
+            public bool Now; public DateTime Last = DateTime.MinValue; public int Count;
+        }
+        private int soundBar = -1;                  // CurrentBar of the last sound (one sound per brick)
 
         private struct Outcome { public char Side, Bit; public bool InF2, InF3; }
 
@@ -191,16 +215,16 @@ namespace NinjaTrader.NinjaScript.Indicators
                 IsSuspendedWhileInactive = false;
                 MaximumBarsLookBack = MaximumBarsLookBack.Infinite;
 
-                Setup1Book = RecorderBookType.MERGED; Setup1F1 = "10"; Setup1F2 = "01,10"; Setup1F3 = ""; Setup1Alert = "1000";
-                Setup2Book = RecorderBookType.MERGED; Setup2F1 = "100"; Setup2F2 = "01,10"; Setup2F3 = ""; Setup2Alert = "1000";
-                Setup3Book = RecorderBookType.MERGED; Setup3F1 = "1000"; Setup3F2 = "01,10"; Setup3F3 = ""; Setup3Alert = "1000";
-                Setup4Book = RecorderBookType.LONG; Setup4F1 = "10"; Setup4F2 = "01,10"; Setup4F3 = ""; Setup4Alert = "1000";
-                Setup5Book = RecorderBookType.LONG; Setup5F1 = "100"; Setup5F2 = "01,10"; Setup5F3 = ""; Setup5Alert = "1000";
-                Setup6Book = RecorderBookType.LONG; Setup6F1 = "1000"; Setup6F2 = "01,10"; Setup6F3 = ""; Setup6Alert = "1000";
-                Setup7Book = RecorderBookType.SHORT; Setup7F1 = "10"; Setup7F2 = "01,10"; Setup7F3 = ""; Setup7Alert = "1000";
-                Setup8Book = RecorderBookType.SHORT; Setup8F1 = "100"; Setup8F2 = "01,10"; Setup8F3 = ""; Setup8Alert = "1000";
-                Setup9Book = RecorderBookType.SHORT; Setup9F1 = "1000"; Setup9F2 = "01,10"; Setup9F3 = ""; Setup9Alert = "1000";
-                Setup10Book = RecorderBookType.MERGED; Setup10F1 = ""; Setup10F2 = ""; Setup10F3 = ""; Setup10Alert = "1000";
+                Setup1Book = RecorderBookType.MERGED; Setup1F1 = "10"; Setup1F2 = "01,10"; Setup1F3 = ""; Setup1Alert = "1000"; Setup1Alert2 = ""; Setup1Alert3 = "";
+                Setup2Book = RecorderBookType.MERGED; Setup2F1 = "100"; Setup2F2 = "01,10"; Setup2F3 = ""; Setup2Alert = "1000"; Setup2Alert2 = ""; Setup2Alert3 = "";
+                Setup3Book = RecorderBookType.MERGED; Setup3F1 = "1000"; Setup3F2 = "01,10"; Setup3F3 = ""; Setup3Alert = "1000"; Setup3Alert2 = ""; Setup3Alert3 = "";
+                Setup4Book = RecorderBookType.LONG; Setup4F1 = "10"; Setup4F2 = "01,10"; Setup4F3 = ""; Setup4Alert = "1000"; Setup4Alert2 = ""; Setup4Alert3 = "";
+                Setup5Book = RecorderBookType.LONG; Setup5F1 = "100"; Setup5F2 = "01,10"; Setup5F3 = ""; Setup5Alert = "1000"; Setup5Alert2 = ""; Setup5Alert3 = "";
+                Setup6Book = RecorderBookType.LONG; Setup6F1 = "1000"; Setup6F2 = "01,10"; Setup6F3 = ""; Setup6Alert = "1000"; Setup6Alert2 = ""; Setup6Alert3 = "";
+                Setup7Book = RecorderBookType.SHORT; Setup7F1 = "10"; Setup7F2 = "01,10"; Setup7F3 = ""; Setup7Alert = "1000"; Setup7Alert2 = ""; Setup7Alert3 = "";
+                Setup8Book = RecorderBookType.SHORT; Setup8F1 = "100"; Setup8F2 = "01,10"; Setup8F3 = ""; Setup8Alert = "1000"; Setup8Alert2 = ""; Setup8Alert3 = "";
+                Setup9Book = RecorderBookType.SHORT; Setup9F1 = "1000"; Setup9F2 = "01,10"; Setup9F3 = ""; Setup9Alert = "1000"; Setup9Alert2 = ""; Setup9Alert3 = "";
+                Setup10Book = RecorderBookType.MERGED; Setup10F1 = ""; Setup10F2 = ""; Setup10F3 = ""; Setup10Alert = "1000"; Setup10Alert2 = ""; Setup10Alert3 = "";
 
                 IncludeBackFill        = true;
                 BackFillMaxBricks      = 1000;
@@ -215,6 +239,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                 LogFolder              = @"C:\temp";
                 LogBaseName            = "Renko_MultiRecorder";
                 AlertSoundFile         = "Alert2.wav";
+                SoundAlert1 = true; SoundAlert2 = false; SoundAlert3 = false;
                 EnableAlertHours       = true;
                 AlertStartHourET = 9;  AlertStartMinuteET = 30;
                 AlertEndHourET   = 16; AlertEndMinuteET   = 0;
@@ -256,24 +281,24 @@ namespace NinjaTrader.NinjaScript.Indicators
         private void BuildSetups()
         {
             setups.Clear();
-            AddSlot(1, Setup1Book, Setup1F1, Setup1F2, Setup1F3, Setup1Alert);
-            AddSlot(2, Setup2Book, Setup2F1, Setup2F2, Setup2F3, Setup2Alert);
-            AddSlot(3, Setup3Book, Setup3F1, Setup3F2, Setup3F3, Setup3Alert);
-            AddSlot(4, Setup4Book, Setup4F1, Setup4F2, Setup4F3, Setup4Alert);
-            AddSlot(5, Setup5Book, Setup5F1, Setup5F2, Setup5F3, Setup5Alert);
-            AddSlot(6, Setup6Book, Setup6F1, Setup6F2, Setup6F3, Setup6Alert);
-            AddSlot(7, Setup7Book, Setup7F1, Setup7F2, Setup7F3, Setup7Alert);
-            AddSlot(8, Setup8Book, Setup8F1, Setup8F2, Setup8F3, Setup8Alert);
-            AddSlot(9, Setup9Book, Setup9F1, Setup9F2, Setup9F3, Setup9Alert);
-            AddSlot(10, Setup10Book, Setup10F1, Setup10F2, Setup10F3, Setup10Alert);
+            AddSlot(1, Setup1Book, Setup1F1, Setup1F2, Setup1F3, Setup1Alert, Setup1Alert2, Setup1Alert3);
+            AddSlot(2, Setup2Book, Setup2F1, Setup2F2, Setup2F3, Setup2Alert, Setup2Alert2, Setup2Alert3);
+            AddSlot(3, Setup3Book, Setup3F1, Setup3F2, Setup3F3, Setup3Alert, Setup3Alert2, Setup3Alert3);
+            AddSlot(4, Setup4Book, Setup4F1, Setup4F2, Setup4F3, Setup4Alert, Setup4Alert2, Setup4Alert3);
+            AddSlot(5, Setup5Book, Setup5F1, Setup5F2, Setup5F3, Setup5Alert, Setup5Alert2, Setup5Alert3);
+            AddSlot(6, Setup6Book, Setup6F1, Setup6F2, Setup6F3, Setup6Alert, Setup6Alert2, Setup6Alert3);
+            AddSlot(7, Setup7Book, Setup7F1, Setup7F2, Setup7F3, Setup7Alert, Setup7Alert2, Setup7Alert3);
+            AddSlot(8, Setup8Book, Setup8F1, Setup8F2, Setup8F3, Setup8Alert, Setup8Alert2, Setup8Alert3);
+            AddSlot(9, Setup9Book, Setup9F1, Setup9F2, Setup9F3, Setup9Alert, Setup9Alert2, Setup9Alert3);
+            AddSlot(10, Setup10Book, Setup10F1, Setup10F2, Setup10F3, Setup10Alert, Setup10Alert2, Setup10Alert3);
             var sb = new StringBuilder();
             sb.AppendLine("Indicator_Renko_MultiRecorder setup check  " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
             foreach (Setup s in setups)
             {
                 string line = s.On
                     ? "Setup " + s.N.ToString("00") + "  ON   " + s.Book + "  F1=[" + string.Join(",", s.p1) + "]  F2=["
-                      + string.Join(",", s.p2) + "]  F3=[" + string.Join(",", s.p3) + "]  alert=[" + string.Join(",", s.pa)
-                      + "]  -> Layer " + s.Layer + (s.Problem.Length > 0 ? "   NOTE: " + s.Problem : "")
+                      + string.Join(",", s.p2) + "]  F3=[" + string.Join(",", s.p3) + "]  alerts: " + s.AlertsText()
+                      + "  -> Layer " + s.Layer + (s.Problem.Length > 0 ? "   NOTE: " + s.Problem : "")
                     : "Setup " + s.N.ToString("00") + "  OFF  " + (s.Problem.Length > 0 ? s.Problem : "(F1 blank)");
                 sb.AppendLine(line);
                 Print("[MultiRecorder] " + line);
@@ -287,7 +312,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                 catch { }
         }
 
-        private void AddSlot(int n, RecorderBookType book, string f1, string f2, string f3, string alert)
+        private void AddSlot(int n, RecorderBookType book, string f1, string f2, string f3, string alert, string alert2, string alert3)
         {
             var s = new Setup { N = n, Book = book, P1 = (f1 ?? "").Trim(), P2 = (f2 ?? "").Trim(), P3 = (f3 ?? "").Trim(), PA = (alert ?? "").Trim() };
             string bad;
@@ -295,7 +320,14 @@ namespace NinjaTrader.NinjaScript.Indicators
             if (!ParseChecked(s.P1, s.p1, out bad)) { s.On = false; s.Problem = "F1 '" + s.P1 + "' " + bad + " -> setup OFF"; setups.Add(s); return; }
             if (!ParseChecked(s.P2, s.p2, out bad)) { s.On = false; s.Problem = "F2 '" + s.P2 + "' " + bad + " -> setup OFF"; setups.Add(s); return; }
             if (!ParseChecked(s.P3, s.p3, out bad)) { s.On = false; s.Problem = "F3 '" + s.P3 + "' " + bad + " -> setup OFF"; setups.Add(s); return; }
-            if (!ParseChecked(s.PA, s.pa, out bad)) { s.On = false; s.Problem = "Alert '" + s.PA + "' " + bad + " -> setup OFF"; setups.Add(s); return; }
+            if (!ParseChecked(s.PA, s.pa, out bad)) { s.On = false; s.Problem = "Alert 1 '" + s.PA + "' " + bad + " -> setup OFF"; setups.Add(s); return; }
+            string[] ap = { s.PA, (alert2 ?? "").Trim(), (alert3 ?? "").Trim() };
+            for (int k = 0; k < 3; k++)
+            {
+                var a = new AlertSlot { K = k + 1, P = ap[k] };
+                if (!ParseChecked(a.P, a.pats, out bad)) { s.On = false; s.Problem = "Alert " + (k + 1) + " '" + a.P + "' " + bad + " -> setup OFF"; setups.Add(s); return; }
+                if (a.pats.Count > 0) s.Alerts.Add(a);
+            }
             if (s.p2.Count == 0 && s.p3.Count > 0) { s.p3.Clear(); s.Problem = "F2 is blank -> F3 ignored (F3 needs F2)"; }
             s.On = true;
             setups.Add(s);
@@ -480,7 +512,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                     + "_F1-" + Safe(s.P1) + "_F2-" + Safe(s.p2.Count > 0 ? s.P2 : "") + "_F3-" + Safe(s.p3.Count > 0 ? s.P3 : "")
                     + "_" + DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss") + ".csv");
                 File.AppendAllText(s.LogPath,
-                    "# " + s.Label + "  alert=" + s.PA + "  reason=" + reason
+                    "# " + s.Label + "  alerts: " + s.AlertsText() + "  reason=" + reason
                     + "  backfill=" + (IncludeBackFill ? "ON(max " + BackFillMaxBricks + (BackFillCrossSession ? ", cross sessions" : ", this session") + ")" : "OFF")
                     + "  resetOnNewSession=" + ResetOnNewSession + "  rollingWindow=" + RollingWindowBits + Environment.NewLine
                     + "timestamp,brick_time,replay,side,bit,inF2,inF3,f1_pct,f1_roll,f2_pct,f2_roll,f3_pct,f3_roll,f1,f2,f3,alarm,trail0" + Environment.NewLine);
@@ -548,27 +580,42 @@ namespace NinjaTrader.NinjaScript.Indicators
             return a <= b ? (now >= a && now < b) : (now >= a || now < b);
         }
 
+        private bool SoundFor(int k) { return k == 1 ? SoundAlert1 : k == 2 ? SoundAlert2 : SoundAlert3; }
+
+        // Each alert (A1..A3) is checked on its own against the end of the last layer string,
+        // only when that string got a NEW bit. Sound: only for alert numbers switched on, inside
+        // the alert hours, and at most one sound per brick for the whole indicator.
         private void CheckAlert(Setup s, int len0)
         {
-            if (s.pa.Count == 0 || s.Deepest.Length <= len0) return;   // only when a NEW bit arrived
-            s.AlarmNow = MatchAny(s.Deepest.ToString(), s.pa);
-            if (!s.AlarmNow) return;
-            s.LastAlert = DateTime.Now; s.AlertCount++;
-            bool sound = InAlertHours();
-            // name + instrument first: with several charts the Alerts window shows which recorder it is
-            string msg = LogBaseName + " (" + (Instrument != null ? Instrument.FullName : "") + ") " + s.Label
-                       + ": F" + s.Layer + " ends with " + s.PA + " (" + s.LastAlert.ToString("HH:mm:ss") + ")";
-            Print("[MultiRecorder] ALERT " + msg + (sound ? "" : "  (outside alert hours: no sound)"));
-            Note(s, "# ALERT " + msg + (sound ? "" : " (no sound: outside hours)"));
-            if (!sound) return;
-            try
+            if (s.Alerts.Count == 0 || s.Deepest.Length <= len0) return;   // only when a NEW bit arrived
+            string deep = s.Deepest.ToString();
+            s.AlarmNow = false;
+            foreach (AlertSlot a in s.Alerts)
             {
-                string snd = AlertSoundFile ?? "";
-                if (snd.Length > 0 && !Path.IsPathRooted(snd))
-                    snd = Path.Combine(NinjaTrader.Core.Globals.InstallDir, "sounds", snd);
-                Alert("MultiRecorder_" + LogBaseName + "_" + writerId + "_S" + s.N + "_" + s.AlertCount, Priority.High, msg, snd, 0, Brushes.DarkOrange, Brushes.Black);
+                a.Now = MatchAny(deep, a.pats);
+                if (!a.Now) continue;
+                s.AlarmNow = true;
+                a.Last = DateTime.Now; a.Count++;
+                s.LastAlert = a.Last; s.AlertCount++;
+                bool hours = InAlertHours(), wanted = SoundFor(a.K);
+                bool sound = hours && wanted && soundBar != CurrentBar;
+                // name + instrument first: with several charts the Alerts window shows which recorder it is
+                string msg = LogBaseName + " (" + (Instrument != null ? Instrument.FullName : "") + ") " + s.Label
+                           + ": A" + a.K + " - F" + s.Layer + " ends with " + a.P + " (" + a.Last.ToString("HH:mm:ss") + ")";
+                string why = sound ? "" : !wanted ? "  (sound off for Alert " + a.K + ")" : !hours ? "  (outside alert hours: no sound)" : "  (one sound per brick: already played)";
+                Print("[MultiRecorder] ALERT " + msg + why);
+                Note(s, "# ALERT " + msg + why);
+                if (!sound) continue;
+                soundBar = CurrentBar;
+                try
+                {
+                    string snd = AlertSoundFile ?? "";
+                    if (snd.Length > 0 && !Path.IsPathRooted(snd))
+                        snd = Path.Combine(NinjaTrader.Core.Globals.InstallDir, "sounds", snd);
+                    Alert("MultiRecorder_" + LogBaseName + "_" + writerId + "_S" + s.N + "_A" + a.K + "_" + a.Count, Priority.High, msg, snd, 0, Brushes.DarkOrange, Brushes.Black);
+                }
+                catch (Exception ex) { Print("[MultiRecorder] alert error: " + ex.Message); }
             }
-            catch (Exception ex) { Print("[MultiRecorder] alert error: " + ex.Message); }
         }
 
         // ── state file for the browser viewer ────────────────────────────────
@@ -668,6 +715,18 @@ namespace NinjaTrader.NinjaScript.Indicators
                       .Append(",\"alarm_now\":").Append(s.AlarmNow ? "true" : "false")
                       .Append(",\"last_alert\":").Append(J(s.LastAlert == DateTime.MinValue ? "" : s.LastAlert.ToString("yyyy-MM-dd HH:mm:ss", ci)))
                       .Append(",\"alert_count\":").Append(s.AlertCount)
+                      .Append(",\"alerts\":[");
+                    for (int k = 0; k < s.Alerts.Count; k++)
+                    {
+                        AlertSlot a = s.Alerts[k];
+                        if (k > 0) sb.Append(",");
+                        sb.Append("{\"k\":").Append(a.K).Append(",\"pattern\":").Append(J(a.P))
+                          .Append(",\"now\":").Append(a.Now ? "true" : "false")
+                          .Append(",\"last\":").Append(J(a.Last == DateTime.MinValue ? "" : a.Last.ToString("yyyy-MM-dd HH:mm:ss", ci)))
+                          .Append(",\"count\":").Append(a.Count)
+                          .Append(",\"sound\":").Append(SoundFor(a.K) ? "true" : "false").Append("}");
+                    }
+                    sb.Append("]")
                       .Append(",\"lines\":[");
                     if (s.On)
                     {
@@ -692,6 +751,19 @@ namespace NinjaTrader.NinjaScript.Indicators
             var sb = new StringBuilder();
             foreach (char c in t) sb.Append(char.IsLetterOrDigit(c) || c == '-' ? c : '_');
             return System.Text.RegularExpressions.Regex.Replace(sb.ToString(), "_+", "_").Trim('_');
+        }
+
+        // HUD alert text: alarming ones first ("<<< A2 10000 10:44"), else the latest one fired
+        private static string HudAlerts(Setup s)
+        {
+            var now = new List<string>(); AlertSlot last = null;
+            foreach (AlertSlot a in s.Alerts)
+            {
+                if (a.Now) now.Add("A" + a.K + " " + a.P + " " + a.Last.ToString("HH:mm:ss"));
+                if (a.Last != DateTime.MinValue && (last == null || a.Last > last.Last)) last = a;
+            }
+            if (now.Count > 0) return "   <<< ALARM " + string.Join(" | ", now);
+            return last != null ? "   last alert A" + last.K + " " + last.Last.ToString("HH:mm:ss") : "";
         }
 
         private string StatePath() { return Path.Combine(LogFolder, LogBaseName + "_state.json"); }
@@ -881,8 +953,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                     + (d.Length > 0 ? "  0s in a row: " + Trail0(d) : "")
                     + "  " + (n > 0 ? (full.Length > n ? "..." : "") + full.Substring(full.Length - n) : "-")
                     + (MoneyNext(s) ? "  [MONEY NEXT]" : "")
-                    + (s.AlarmNow ? "   <<< ALARM (" + s.PA + ") " + s.LastAlert.ToString("HH:mm:ss")
-                       : s.LastAlert != DateTime.MinValue ? "   last alert " + s.LastAlert.ToString("HH:mm:ss") : "");
+                    + HudAlerts(s);
                 sb.Append(Environment.NewLine).Append(line);
             }
             NinjaTrader.NinjaScript.DrawingTools.TextPosition pos =
@@ -947,8 +1018,12 @@ namespace NinjaTrader.NinjaScript.Indicators
         public string Setup1F2 { get; set; }
         [Display(Name="F3 Pattern (leave blank to skip; needs F2)", Order=4, GroupName="Setup 01")]
         public string Setup1F3 { get; set; }
-        [Display(Name="Last Layer Alert Pattern (blank = no alert)", Order=5, GroupName="Setup 01")]
+        [Display(Name="Alert 1 - last layer pattern (blank = none)", Order=5, GroupName="Setup 01")]
         public string Setup1Alert { get; set; }
+        [Display(Name="Alert 2 - last layer pattern (blank = none)", Order=6, GroupName="Setup 01")]
+        public string Setup1Alert2 { get; set; }
+        [Display(Name="Alert 3 - last layer pattern (blank = none)", Order=7, GroupName="Setup 01")]
+        public string Setup1Alert3 { get; set; }
 
         [Display(Name="Book", Order=1, GroupName="Setup 02")]
         public RecorderBookType Setup2Book { get; set; }
@@ -958,8 +1033,12 @@ namespace NinjaTrader.NinjaScript.Indicators
         public string Setup2F2 { get; set; }
         [Display(Name="F3 Pattern (leave blank to skip; needs F2)", Order=4, GroupName="Setup 02")]
         public string Setup2F3 { get; set; }
-        [Display(Name="Last Layer Alert Pattern (blank = no alert)", Order=5, GroupName="Setup 02")]
+        [Display(Name="Alert 1 - last layer pattern (blank = none)", Order=5, GroupName="Setup 02")]
         public string Setup2Alert { get; set; }
+        [Display(Name="Alert 2 - last layer pattern (blank = none)", Order=6, GroupName="Setup 02")]
+        public string Setup2Alert2 { get; set; }
+        [Display(Name="Alert 3 - last layer pattern (blank = none)", Order=7, GroupName="Setup 02")]
+        public string Setup2Alert3 { get; set; }
 
         [Display(Name="Book", Order=1, GroupName="Setup 03")]
         public RecorderBookType Setup3Book { get; set; }
@@ -969,8 +1048,12 @@ namespace NinjaTrader.NinjaScript.Indicators
         public string Setup3F2 { get; set; }
         [Display(Name="F3 Pattern (leave blank to skip; needs F2)", Order=4, GroupName="Setup 03")]
         public string Setup3F3 { get; set; }
-        [Display(Name="Last Layer Alert Pattern (blank = no alert)", Order=5, GroupName="Setup 03")]
+        [Display(Name="Alert 1 - last layer pattern (blank = none)", Order=5, GroupName="Setup 03")]
         public string Setup3Alert { get; set; }
+        [Display(Name="Alert 2 - last layer pattern (blank = none)", Order=6, GroupName="Setup 03")]
+        public string Setup3Alert2 { get; set; }
+        [Display(Name="Alert 3 - last layer pattern (blank = none)", Order=7, GroupName="Setup 03")]
+        public string Setup3Alert3 { get; set; }
 
         [Display(Name="Book", Order=1, GroupName="Setup 04")]
         public RecorderBookType Setup4Book { get; set; }
@@ -980,8 +1063,12 @@ namespace NinjaTrader.NinjaScript.Indicators
         public string Setup4F2 { get; set; }
         [Display(Name="F3 Pattern (leave blank to skip; needs F2)", Order=4, GroupName="Setup 04")]
         public string Setup4F3 { get; set; }
-        [Display(Name="Last Layer Alert Pattern (blank = no alert)", Order=5, GroupName="Setup 04")]
+        [Display(Name="Alert 1 - last layer pattern (blank = none)", Order=5, GroupName="Setup 04")]
         public string Setup4Alert { get; set; }
+        [Display(Name="Alert 2 - last layer pattern (blank = none)", Order=6, GroupName="Setup 04")]
+        public string Setup4Alert2 { get; set; }
+        [Display(Name="Alert 3 - last layer pattern (blank = none)", Order=7, GroupName="Setup 04")]
+        public string Setup4Alert3 { get; set; }
 
         [Display(Name="Book", Order=1, GroupName="Setup 05")]
         public RecorderBookType Setup5Book { get; set; }
@@ -991,8 +1078,12 @@ namespace NinjaTrader.NinjaScript.Indicators
         public string Setup5F2 { get; set; }
         [Display(Name="F3 Pattern (leave blank to skip; needs F2)", Order=4, GroupName="Setup 05")]
         public string Setup5F3 { get; set; }
-        [Display(Name="Last Layer Alert Pattern (blank = no alert)", Order=5, GroupName="Setup 05")]
+        [Display(Name="Alert 1 - last layer pattern (blank = none)", Order=5, GroupName="Setup 05")]
         public string Setup5Alert { get; set; }
+        [Display(Name="Alert 2 - last layer pattern (blank = none)", Order=6, GroupName="Setup 05")]
+        public string Setup5Alert2 { get; set; }
+        [Display(Name="Alert 3 - last layer pattern (blank = none)", Order=7, GroupName="Setup 05")]
+        public string Setup5Alert3 { get; set; }
 
         [Display(Name="Book", Order=1, GroupName="Setup 06")]
         public RecorderBookType Setup6Book { get; set; }
@@ -1002,8 +1093,12 @@ namespace NinjaTrader.NinjaScript.Indicators
         public string Setup6F2 { get; set; }
         [Display(Name="F3 Pattern (leave blank to skip; needs F2)", Order=4, GroupName="Setup 06")]
         public string Setup6F3 { get; set; }
-        [Display(Name="Last Layer Alert Pattern (blank = no alert)", Order=5, GroupName="Setup 06")]
+        [Display(Name="Alert 1 - last layer pattern (blank = none)", Order=5, GroupName="Setup 06")]
         public string Setup6Alert { get; set; }
+        [Display(Name="Alert 2 - last layer pattern (blank = none)", Order=6, GroupName="Setup 06")]
+        public string Setup6Alert2 { get; set; }
+        [Display(Name="Alert 3 - last layer pattern (blank = none)", Order=7, GroupName="Setup 06")]
+        public string Setup6Alert3 { get; set; }
 
         [Display(Name="Book", Order=1, GroupName="Setup 07")]
         public RecorderBookType Setup7Book { get; set; }
@@ -1013,8 +1108,12 @@ namespace NinjaTrader.NinjaScript.Indicators
         public string Setup7F2 { get; set; }
         [Display(Name="F3 Pattern (leave blank to skip; needs F2)", Order=4, GroupName="Setup 07")]
         public string Setup7F3 { get; set; }
-        [Display(Name="Last Layer Alert Pattern (blank = no alert)", Order=5, GroupName="Setup 07")]
+        [Display(Name="Alert 1 - last layer pattern (blank = none)", Order=5, GroupName="Setup 07")]
         public string Setup7Alert { get; set; }
+        [Display(Name="Alert 2 - last layer pattern (blank = none)", Order=6, GroupName="Setup 07")]
+        public string Setup7Alert2 { get; set; }
+        [Display(Name="Alert 3 - last layer pattern (blank = none)", Order=7, GroupName="Setup 07")]
+        public string Setup7Alert3 { get; set; }
 
         [Display(Name="Book", Order=1, GroupName="Setup 08")]
         public RecorderBookType Setup8Book { get; set; }
@@ -1024,8 +1123,12 @@ namespace NinjaTrader.NinjaScript.Indicators
         public string Setup8F2 { get; set; }
         [Display(Name="F3 Pattern (leave blank to skip; needs F2)", Order=4, GroupName="Setup 08")]
         public string Setup8F3 { get; set; }
-        [Display(Name="Last Layer Alert Pattern (blank = no alert)", Order=5, GroupName="Setup 08")]
+        [Display(Name="Alert 1 - last layer pattern (blank = none)", Order=5, GroupName="Setup 08")]
         public string Setup8Alert { get; set; }
+        [Display(Name="Alert 2 - last layer pattern (blank = none)", Order=6, GroupName="Setup 08")]
+        public string Setup8Alert2 { get; set; }
+        [Display(Name="Alert 3 - last layer pattern (blank = none)", Order=7, GroupName="Setup 08")]
+        public string Setup8Alert3 { get; set; }
 
         [Display(Name="Book", Order=1, GroupName="Setup 09")]
         public RecorderBookType Setup9Book { get; set; }
@@ -1035,8 +1138,12 @@ namespace NinjaTrader.NinjaScript.Indicators
         public string Setup9F2 { get; set; }
         [Display(Name="F3 Pattern (leave blank to skip; needs F2)", Order=4, GroupName="Setup 09")]
         public string Setup9F3 { get; set; }
-        [Display(Name="Last Layer Alert Pattern (blank = no alert)", Order=5, GroupName="Setup 09")]
+        [Display(Name="Alert 1 - last layer pattern (blank = none)", Order=5, GroupName="Setup 09")]
         public string Setup9Alert { get; set; }
+        [Display(Name="Alert 2 - last layer pattern (blank = none)", Order=6, GroupName="Setup 09")]
+        public string Setup9Alert2 { get; set; }
+        [Display(Name="Alert 3 - last layer pattern (blank = none)", Order=7, GroupName="Setup 09")]
+        public string Setup9Alert3 { get; set; }
 
         [Display(Name="Book", Order=1, GroupName="Setup 10")]
         public RecorderBookType Setup10Book { get; set; }
@@ -1046,8 +1153,12 @@ namespace NinjaTrader.NinjaScript.Indicators
         public string Setup10F2 { get; set; }
         [Display(Name="F3 Pattern (leave blank to skip; needs F2)", Order=4, GroupName="Setup 10")]
         public string Setup10F3 { get; set; }
-        [Display(Name="Last Layer Alert Pattern (blank = no alert)", Order=5, GroupName="Setup 10")]
+        [Display(Name="Alert 1 - last layer pattern (blank = none)", Order=5, GroupName="Setup 10")]
         public string Setup10Alert { get; set; }
+        [Display(Name="Alert 2 - last layer pattern (blank = none)", Order=6, GroupName="Setup 10")]
+        public string Setup10Alert2 { get; set; }
+        [Display(Name="Alert 3 - last layer pattern (blank = none)", Order=7, GroupName="Setup 10")]
+        public string Setup10Alert3 { get; set; }
 
         [Display(Name="Include back fill (replay stored bricks on enable)", Order=1, GroupName="Common 1. History")]
         public bool IncludeBackFill { get; set; }
@@ -1115,6 +1226,16 @@ namespace NinjaTrader.NinjaScript.Indicators
         [Range(0, 59)]
         [Display(Name="Alert end minute (ET)", Order=6, GroupName="Common 4. Alert")]
         public int AlertEndMinuteET { get; set; }
+
+        [Display(Name="Sound for Alert 1 (all setups)", Order=7, GroupName="Common 4. Alert",
+            Description="Off = Alert 1 still shows on the HUD, in the viewer and in the log, without sound. Max one sound per brick.")]
+        public bool SoundAlert1 { get; set; }
+
+        [Display(Name="Sound for Alert 2 (all setups)", Order=8, GroupName="Common 4. Alert")]
+        public bool SoundAlert2 { get; set; }
+
+        [Display(Name="Sound for Alert 3 (all setups)", Order=9, GroupName="Common 4. Alert")]
+        public bool SoundAlert3 { get; set; }
 
         [Range(1, 500)]
         [Display(Name="Speed: average over last N bricks", Order=1, GroupName="Common 5. Speed",

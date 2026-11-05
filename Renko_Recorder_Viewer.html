@@ -58,6 +58,13 @@
   .run b { color: var(--accent); }
   label.wrap { white-space: normal; }
   .chart { font-weight: 500; color: var(--muted); }
+  .alerts { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 6px; font-size: 13px; color: var(--muted); }
+  .al { font-size: 12.5px; font-weight: 600; padding: 2px 9px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); font-variant-numeric: tabular-nums; }
+  .al.now { color: #fff; background: var(--accent); border-color: var(--accent); }
+  .al .q { font-weight: 400; opacity: .85; }
+  .hot { background: var(--accent-bg); border: 1px solid var(--accent); border-radius: 8px; padding: 8px 12px; margin: 6px 0 12px; }
+  .hot b { color: var(--accent); }
+  .hot a { color: var(--ink); margin-right: 14px; text-decoration: none; border-bottom: 1px dotted var(--accent); }
   .rec-head .live, .live { font-size: 12px; font-weight: 700; padding: 1px 8px; border-radius: 999px; color: var(--panel) !important; background: var(--one); }
   .rec-head .dead, .dead { font-size: 12px; font-weight: 700; padding: 1px 8px; border-radius: 999px; color: var(--off); border: 1px solid var(--line); }
   details.notrun { margin: 26px 0 0; border-top: 1px dashed var(--line); padding-top: 10px; }
@@ -120,6 +127,8 @@
     </ol>
     <p>Each recorder writes <code>&lt;LogBaseName&gt;_state.json</code> after every brick. The line with a dark left edge is the deepest (money) layer.
     "0s in a row" = how many 0's follow the last 1 of that string.
+    <b>Alerts</b> A1–A3 sit under the last layer of each setup (orange = alarming now; "silent" = no sound in NinjaTrader);
+    a recorder with an alarming setup shows an orange <b>ALARMING NOW</b> strip on top — click an entry to jump to its card.
     <b>Market speed</b> = average seconds per brick over the last N bricks of this session (set in the indicator, "Common 5. Speed");
     "this brick open" counts up live from the last brick close.
     <b>Check it matches the chart:</b> the HUD line "state file … #N" on the chart and "update #N" here should show the same number.
@@ -230,11 +239,12 @@
   function checkAlerts() {
     let fresh = false;
     for (const [file, st] of Object.entries(states))
-      for (const s of st.setups || []) {
-        const k = file + '#' + (st.writer || '') + '#' + s.n, c = s.alert_count || 0;   // per run: a restart counts from 0 again
-        if (k in lastAlertCounts && c > lastAlertCounts[k]) fresh = true;
-        lastAlertCounts[k] = c;
-      }
+      for (const s of st.setups || [])
+        for (const a of alertsOf(s)) {
+          const k = file + '#' + (st.writer || '') + '#' + s.n + '#A' + a.k, c = a.count || 0;   // per run and per alert
+          if (k in lastAlertCounts && c > lastAlertCounts[k]) fresh = true;
+          lastAlertCounts[k] = c;
+        }
     if (fresh && $('beep').checked) beep();
   }
 
@@ -258,6 +268,7 @@
     return out;
   }
   // 0's after the last 1 of a string (all 0's -> its length); uses the recorder's value when present
+  function cardId(f, n) { return 'c-' + f.replace(/[^A-Za-z0-9]/g, '_') + '-' + n; }
   function trail0(l) { if (typeof l.trail0 === 'number') return l.trail0; const s = l.s || ''; const k = s.lastIndexOf('1'); return s.length - k - 1; }
   function ago(ts) { if (!ts) return null; const t = new Date(ts.replace(' ', 'T')); return isNaN(t) ? null : (Date.now() - t) / 1000; }
   function hm(ts) { return ts ? ts.slice(11, 19) : ''; }
@@ -286,6 +297,19 @@
     }
     main.innerHTML = html;
     const d = main.querySelector('details.notrun'); if (d) d.addEventListener('toggle', () => { notrunOpen = d.open; });
+  }
+
+  // a setup's alerts: v1.5 sends "alerts" (A1..A3); older recorders only "alert"
+  function alertsOf(s) {
+    if (Array.isArray(s.alerts)) return s.alerts;
+    return s.alert ? [{ k: 1, pattern: s.alert, now: !!s.alarm_now, last: s.last_alert || '', count: s.alert_count || 0, sound: true }] : [];
+  }
+  function alertsHtml(s) {
+    const al = alertsOf(s); if (!al.length) return '';
+    return '<div class="alerts"><span>alerts on this line:</span>' + al.map(a =>
+      '<span class="al' + (a.now ? ' now' : '') + '" title="' + (a.sound ? 'sound on in NinjaTrader' : 'silent in NinjaTrader (text only)') + ' · fired ' + (a.count || 0) + 'x">A' + a.k + ' ' + esc(a.pattern)
+      + (a.now ? ' · ALARMING NOW ' + esc(hm(a.last)) : a.last ? ' <span class="q">· last ' + esc(hm(a.last)) + '</span>' : ' <span class="q">· not yet</span>')
+      + (a.sound ? '' : ' <span class="q">· silent</span>') + '</span>').join('') + '</div>';
   }
 
   // one <section> per recorder file
@@ -322,6 +346,10 @@
                 : sp.label && open > sp.normal && (sp.label === 'FAST' || sp.label === 'NORMAL') ? ' <span class="spd SLOW">slowing</span>' : '') + '</span>' : '')
           + '<span title="thresholds from the indicator settings (Common 5. Speed)">FAST ≤' + sp.fast + 's · NORMAL ≤' + sp.normal + 's · SLOW ≤' + sp.slow + 's</span></div>';
       }
+      const hot = (st.setups || []).filter(s => s.on && s.alarm_now);
+      if (hot.length && info[f].live)
+        html += '<div class="hot"><b>ALARMING NOW:</b> ' + hot.map(s => '<a href="#' + esc(cardId(f, s.n)) + '">S' + String(s.n).padStart(2, '0') + ' '
+          + esc(s.book) + ' F1=' + esc(s.f1) + ' — ' + esc(alertsOf(s).filter(a => a.now).map(a => 'A' + a.k + ' ' + a.pattern).join(', ')) + '</a>').join('') + '</div>';
       for (const s of st.setups || []) {
         if (!s.on && $('hideOff').checked && !s.problem) continue;
         const sn = 'S' + String(s.n).padStart(2, '0');
@@ -329,12 +357,10 @@
         const title = s.book + '  F1=' + s.f1 + (s.f2 ? '  F2=' + s.f2 : '') + (s.f3 ? '  F3=' + s.f3 : '');
         if (!s.on) { html += '<div class="card off"><div class="title">' + sn + ' ' + chart + ' ' + esc(title) + ' <span class="badge">OFF</span></div>'
           + (s.problem ? '<div class="stats">' + esc(s.problem) + '</div>' : '') + '</div>'; continue; }
-        html += '<div class="card' + (s.alarm_now ? ' alarm' : '') + '"><div class="title">' + sn + ' ' + chart + ' ' + esc(title)
+        html += '<div class="card' + (s.alarm_now ? ' alarm' : '') + '" id="' + esc(cardId(f, s.n)) + '"><div class="title">' + sn + ' ' + chart + ' ' + esc(title)
           + '<span class="badge">Layer ' + s.layer + '</span>'
-          + (s.alert ? '<span class="badge">alert ' + esc(s.alert) + '</span>' : '')
           + (s.money_next ? '<span class="badge money">MONEY NEXT</span>' : '')
-          + (s.alarm_now ? '<span class="badge alarm">ALARMING NOW ' + esc(hm(s.last_alert)) + '</span>'
-             : s.last_alert ? '<span class="badge">last alert ' + esc(hm(s.last_alert)) + '</span>' : '')
+          + (s.alarm_now ? '<span class="badge alarm">ALARMING NOW ' + esc(alertsOf(s).filter(a => a.now).map(a => 'A' + a.k).join(' ')) + ' ' + esc(hm(s.last_alert)) + '</span>' : '')
           + (s.problem ? '<span class="badge">' + esc(s.problem) + '</span>' : '') + '</div>';
         const n = (s.lines || []).length;
         (s.lines || []).forEach((l, i) => {
@@ -344,7 +370,7 @@
             + (l.pct !== '' ? ' · 1s ' + l.ones + ' = <b>' + esc(l.pct) + '%</b>' : '')
             + (l.roll !== '' ? ' · last ' + Math.min(st.rolling, l.bits) + ': <b>' + esc(l.roll) + '%</b>' : '')
             + (i === n - 1 && l.bits > 0 ? ' · <span class="run">0s in a row: <b>' + trail0(l) + '</b></span>' : '')
-            + '</div><div class="bits">' + bitsHtml(l.s) + '</div></div>';
+            + '</div><div class="bits">' + bitsHtml(l.s) + '</div>' + (i === n - 1 ? alertsHtml(s) : '') + '</div>';
         });
         html += '</div>';
       }
@@ -373,8 +399,10 @@
     states['Renko_MultiRecorder_state.json'] = { recorder: 'Renko_MultiRecorder', written: ts(now), instrument: 'MNQ 12-26', brick: 'Renko 40',
       last_brick: ts(now), since: '', writer: 'a1b2c3d4', seq: 412, running: true, heartbeat_s: 20, brick_saved: ts(new Date(Date.now() - 47e3)), speed: { window: 10, n: 10, avg_s: 24.6, last_s: 11.0, label: 'FAST', fast: 30, normal: 90, slow: 300 }, history: 'back fill 640 bricks from 10-27 06:30:02; stopped: session start reached', rolling: 20, reset_on_new_session: true,
       setups: [
-        { n: 1, book: 'MERGED', on: true, problem: '', f1: '10', f2: '01,10', f3: '', alert: '1000', layer: 2, money_next: false, alarm_now: false, last_alert: ts(new Date(now - 6e5)), alert_count: 3, lines: [L('F1', '10', f1a), L('F2', '01,10', r(120, 0.35) + '10000')] },
-        { n: 2, book: 'MERGED', on: true, problem: '', f1: '100', f2: '01,10', f3: '', alert: '1000', layer: 2, money_next: true, alarm_now: true, last_alert: ts(now), alert_count: 1, lines: [L('F1', '100', f1b), L('F2', '01,10', f2b)] },
+        { n: 1, book: 'MERGED', on: true, problem: '', f1: '10', f2: '01,10', f3: '', alert: '1000', layer: 2, money_next: false, alarm_now: false, last_alert: ts(new Date(now - 6e5)), alert_count: 3,
+          alerts: [{ k: 1, pattern: '1000', now: false, last: ts(new Date(now - 6e5)), count: 2, sound: true }, { k: 2, pattern: '10000', now: false, last: ts(new Date(now - 3e5)), count: 1, sound: false }], lines: [L('F1', '10', f1a), L('F2', '01,10', r(120, 0.35) + '10000')] },
+        { n: 2, book: 'MERGED', on: true, problem: '', f1: '100', f2: '01,10', f3: '', alert: '1000', layer: 2, money_next: true, alarm_now: true, last_alert: ts(now), alert_count: 1,
+          alerts: [{ k: 1, pattern: '1000', now: true, last: ts(now), count: 1, sound: true }, { k: 2, pattern: '10000', now: false, last: '', count: 0, sound: false }, { k: 3, pattern: '100', now: false, last: ts(new Date(now - 9e4)), count: 4, sound: false }], lines: [L('F1', '100', f1b), L('F2', '01,10', f2b)] },
         { n: 3, book: 'LONG', on: true, problem: '', f1: '10', f2: '', f3: '', alert: '1000', layer: 1, money_next: false, alarm_now: false, last_alert: '', alert_count: 0, lines: [L('F1', '10', r(160, 0.35))] },
         { n: 5, book: 'SHORT', on: true, problem: '', f1: '100', f2: '10?', f3: '00', alert: '1000', layer: 3, money_next: false, alarm_now: false, last_alert: '', alert_count: 0, lines: [L('F1', '100', r(80, 0.34)), L('F2', '10?', r(20, 0.4)), L('F3', '00', r(6, 0.4))] },
         { n: 10, book: 'MERGED', on: false, problem: "F1 '1O' has an invalid character 'O' (only 0 1 * ? and commas) -> setup OFF", f1: '1O', f2: '', f3: '', alert: '1000', layer: 0, money_next: false, alarm_now: false, last_alert: '', alert_count: 0, lines: [] }
