@@ -10,6 +10,9 @@ using NinjaTrader.NinjaScript;
 using NinjaTrader.NinjaScript.Strategies;
 #endregion
 
+// 2026-11-06  Logging only: start-up lines ([QTY RULE] parsed, pattern parsing) were printed before the log
+//             file existed and never reached it; now buffered and written, plus a [QTY RULE] ON/OFF + table line
+//             in every new log (also after a new-session restart). NO trading logic change.
 // 2026-10-28  Parameter DISPLAY ORDER unified across all 9 transit files (merged/LONG/SHORT x L1/L2/L3):
 //             1 Filter & Order, 2 Quantity, 3 Limits & Exit, 4 Entry & Bracket, 5 Hours, 6 Session,
 //             7 Gates, 8 Logging, 9 Margin. Only [Display] GroupName/Order changed - NO logic change.
@@ -897,6 +900,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             DiagLog("[FRESH START] " + reason + " | seed=" + seed + " | new log=" + activeLogFilePath
                 + " | pipeline EMPTY" + (seed ? " (session back-fill runs on the first live brick)" : ", will arm naturally")
                 + " (no real trades until a transit fires).");
+            FlushPendingLog();
+            DiagLog(QtyRuleSummary());
             DiagLog(string.Format("{0} ready (MERGED L3). EnableRealOrder={1}, F1=[{2}], F2=[{3}], F3=[{11}], Stop={4}pt, Target={5}pt, "
                 + "ExitBit={6}({7}), MaxLossRow={8}, Seed={9}, RestartOnNewSession={10} | "
                 + "Hours={12}({13:00}:{14:00}-{15:00}:{16:00} NY) | MarginCutoff={17} flat@{18:00}:{19:00} NY "
@@ -1208,6 +1213,28 @@ namespace NinjaTrader.NinjaScript.Strategies
             return sb.ToString(len - n, n);
         }
 
+        private readonly System.Collections.Generic.List<string> pendingLog = new System.Collections.Generic.List<string>();
+
+        // write start-up lines that were logged before the log file existed (pattern / qty-rule parsing)
+        private void FlushPendingLog()
+        {
+            if (activeLogFilePath == null || pendingLog.Count == 0) return;
+            try { File.AppendAllLines(activeLogFilePath, pendingLog); } catch { }
+            pendingLog.Clear();
+        }
+
+        // one line in every new log: is the qty rule on, and which table is in force
+        private string QtyRuleSummary()
+        {
+            var sb = new StringBuilder();
+            int max = 1;
+            if (qtyTable != null)
+                foreach (var row in qtyTable) { sb.Append(row.pattern).Append("->x").Append(row.multiplier).Append("  "); if (row.multiplier > max) max = row.multiplier; }
+            return "[QTY RULE] " + (EnableQtyIncrement ? "ON" : "OFF (every trade = base qty " + BaseQuantity + ")")
+                 + " | table: " + (sb.Length > 0 ? sb.ToString().Trim() : "(empty)") + " | base qty " + BaseQuantity
+                 + (EnableQtyIncrement && max > 20 ? "  !! multiplier above 20 - this merged file has NO cap, check for a typo" : "");
+        }
+
         private void DiagLog(string msg)
         {
             string line = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + "  " + msg;
@@ -1215,6 +1242,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 if (activeLogFilePath != null)
                     File.AppendAllText(activeLogFilePath, line + Environment.NewLine);
+                else
+                    pendingLog.Add(line);       // before the log file exists (start-up parsing): keep, write later
             }
             catch { }
             Print(line);
