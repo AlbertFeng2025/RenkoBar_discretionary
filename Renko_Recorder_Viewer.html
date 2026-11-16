@@ -126,6 +126,7 @@
       <li><b>Fresh start (optional):</b> delete the old files ending in <code>_state.json</code> from the Log Folder. Running recorders write a new one on their next brick. Keep the <code>.csv</code> files — they are your history.</li>
     </ol>
     <p>Each recorder writes <code>&lt;LogBaseName&gt;_state.json</code> after every brick. The line with a dark left edge is the deepest (money) layer.
+    A setup can have up to four layers (F1–F4): F3 needs F2, and F4 needs F3 — a deeper pattern with a blank layer above it is ignored and the card shows a note.
     "0s in a row" = how many 0's follow the last 1 of that string.
     <b>Alerts</b> A1–A3 sit under the last layer of each setup (orange = alarming now; "silent" = no sound in NinjaTrader);
     a recorder with an alarming setup shows an orange <b>ALARMING NOW</b> strip on top — click an entry to jump to its card.
@@ -354,7 +355,7 @@
         if (!s.on && $('hideOff').checked && !s.problem) continue;
         const sn = 'S' + String(s.n).padStart(2, '0');
         const chart = '<span class="chart">' + (files.length > 1 ? esc(st.recorder) + ' · ' : '') + esc(st.instrument) + ' · ' + esc(st.brick) + '</span>' + (st.speed ? spdBadge(st.speed) : '');
-        const title = s.book + '  F1=' + s.f1 + (s.f2 ? '  F2=' + s.f2 : '') + (s.f3 ? '  F3=' + s.f3 : '');
+        const title = s.book + '  F1=' + s.f1 + (s.f2 ? '  F2=' + s.f2 : '') + (s.f3 ? '  F3=' + s.f3 : '') + (s.f4 ? '  F4=' + s.f4 : '');
         if (!s.on) { html += '<div class="card off"><div class="title">' + sn + ' ' + chart + ' ' + esc(title) + ' <span class="badge">OFF</span></div>'
           + (s.problem ? '<div class="stats">' + esc(s.problem) + '</div>' : '') + '</div>'; continue; }
         html += '<div class="card' + (s.alarm_now ? ' alarm' : '') + '" id="' + esc(cardId(f, s.n)) + '"><div class="title">' + sn + ' ' + chart + ' ' + esc(title)
@@ -405,6 +406,7 @@
           alerts: [{ k: 1, pattern: '1000', now: true, last: ts(now), count: 1, sound: true }, { k: 2, pattern: '10000', now: false, last: '', count: 0, sound: false }, { k: 3, pattern: '100', now: false, last: ts(new Date(now - 9e4)), count: 4, sound: false }], lines: [L('F1', '100', f1b), L('F2', '01,10', f2b)] },
         { n: 3, book: 'LONG', on: true, problem: '', f1: '10', f2: '', f3: '', alert: '1000', layer: 1, money_next: false, alarm_now: false, last_alert: '', alert_count: 0, lines: [L('F1', '10', r(160, 0.35))] },
         { n: 5, book: 'SHORT', on: true, problem: '', f1: '100', f2: '10?', f3: '00', alert: '1000', layer: 3, money_next: false, alarm_now: false, last_alert: '', alert_count: 0, lines: [L('F1', '100', r(80, 0.34)), L('F2', '10?', r(20, 0.4)), L('F3', '00', r(6, 0.4))] },
+        { n: 6, book: 'MERGED', on: true, problem: '', f1: '10', f2: '01,10', f3: '1000', f4: '0', alert: '1000', layer: 4, money_next: false, alarm_now: false, last_alert: '', alert_count: 0, lines: [L('F1', '10', r(120, 0.34)), L('F2', '01,10', r(50, 0.35)), L('F3', '1000', r(12, 0.35)), L('F4', '0', r(4, 0.4))] },
         { n: 10, book: 'MERGED', on: false, problem: "F1 '1O' has an invalid character 'O' (only 0 1 * ? and commas) -> setup OFF", f1: '1O', f2: '', f3: '', alert: '1000', layer: 0, money_next: false, alarm_now: false, last_alert: '', alert_count: 0, lines: [] }
       ] };
     const old = JSON.parse(JSON.stringify(states['Renko_MultiRecorder_state.json']));

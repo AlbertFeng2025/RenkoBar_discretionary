@@ -21,6 +21,14 @@ public enum RecorderHudCorner { BottomLeft, BottomRight, TopLeft, TopRight, Cent
 // =============================================================================
 // Indicator_Renko_MultiRecorder  —  up to 10 Renko transit setups in ONE indicator (observer)
 // =============================================================================
+// v1.6 2026-11-16  LAYER 4
+//   * New "F4 Pattern" box per setup: F4 is matched on the F3 string; on a tail match the NEXT F3
+//     outcome is copied into the F4 string (same rule as F2 and F3). The deepest string is then F4.
+//   * F4 needs F3 (and F3 needs F2): with F3 blank, F4 is ignored with a note. All F4 boxes are blank
+//     by default, so existing setups (Layer 1 / 2 / 3) behave and log exactly as before.
+//   * MONEY NEXT = F2 (+F3) (+F4) armed. Alerts follow the last layer (F4 when set).
+//   * CSV: four columns ADDED AT THE END (inF4, f4_pct, f4_roll, f4); the file name gets "_F4-..."
+//     only when F4 is set. State file: "f4" + an F4 line for the viewer.
 // v1.5 2026-11-05  (alerts only; the strings are unchanged)
 //   * Up to THREE separate alerts per setup on the last layer: Alert 1 (default 1000), Alert 2 and
 //     Alert 3 (default blank). Each has its own pattern, count and time, and is reported by name
@@ -80,7 +88,8 @@ public enum RecorderHudCorner { BottomLeft, BottomRight, TopLeft, TopRight, Cent
 //
 // SETUP SLOTS ("Setup 01" .. "Setup 10")
 //   Book   MERGED / LONG / SHORT (drop-down)
-//   F1     blank = slot OFF.  F2 blank = Layer 1.  F3 blank = Layer 2.  F3 needs F2.
+//   F1     blank = slot OFF.  F2 blank = Layer 1.  F3 blank = Layer 2.  F4 blank = Layer 3.
+//          F3 needs F2, F4 needs F3.
 //   Alert  last-layer alert pattern, default 1000 (blank = no alert).
 //   Patterns: '0' '1', '?' = one-or-more 1s, '*' = one-or-more 0s, comma = OR, tail match.
 //   A pattern with any other character turns that slot OFF with a clear message in the
@@ -91,8 +100,9 @@ public enum RecorderHudCorner { BottomLeft, BottomRight, TopLeft, TopRight, Cent
 //   LONG  book: raw = bricks as is;  F1 match -> next brick GREEN = '1', RED = '0'.
 //   SHORT book: raw = bricks flipped (red=1); F1 match -> next brick RED = '1'.
 //   MERGED    : F1 tested on BOTH raw strings, outcomes interleaved in ONE F1 string.
-//   F2 on the F1 string, F3 on the F2 string: on a tail match the NEXT outcome is copied.
-//   The deepest active string is the would-be money string; "MONEY NEXT" = F2 (+F3) armed.
+//   F2 on the F1 string, F3 on the F2 string, F4 on the F3 string: on a tail match the NEXT
+//   outcome is copied. The deepest active string is the would-be money string;
+//   "MONEY NEXT" = F2 (+F3) (+F4) armed.
 //
 // HISTORY / SESSIONS
 //   * Include back fill (default ON): on the first live brick the stored bricks are replayed
@@ -112,7 +122,7 @@ public enum RecorderHudCorner { BottomLeft, BottomRight, TopLeft, TopRight, Cent
 //
 // FILES (in Log Folder)
 //   <LogBaseName>_<chart>_S<n>_<BOOK>_F1-<p>_F2-<p>_F3-<p>_<stamp>.csv   one per setup per enable (chart e.g. MNQ_12-26_Renko_40)
-//      timestamp,brick_time,replay,side,bit,inF2,inF3,f1_pct,f1_roll,f2_pct,f2_roll,f3_pct,f3_roll,f1,f2,f3,alarm,trail0
+//      timestamp,brick_time,replay,side,bit,inF2,inF3,f1_pct,f1_roll,f2_pct,f2_roll,f3_pct,f3_roll,f1,f2,f3,alarm,trail0,inF4,f4_pct,f4_roll,f4
 //   <LogBaseName>_state.json     current state of all setups (rewritten every brick)
 //   <LogBaseName>_<chart>_setup_check.txt   what each slot was understood as (written on enable)
 //   ('*' is written as 'z', '?' as 'o', ',' as '_' in file names)
@@ -125,30 +135,30 @@ namespace NinjaTrader.NinjaScript.Indicators
         private class Setup
         {
             public int N; public RecorderBookType Book;
-            public string P1, P2, P3, PA;                       // as typed
+            public string P1, P2, P3, P4 = "", PA;             // as typed
             public readonly List<string> p1 = new List<string>(), p2 = new List<string>(),
-                                         p3 = new List<string>(), pa = new List<string>();
+                                         p3 = new List<string>(), p4 = new List<string>(), pa = new List<string>();
             public bool On; public string Problem = "";
             public readonly StringBuilder RawL = new StringBuilder(), RawS = new StringBuilder();
-            public readonly StringBuilder F1 = new StringBuilder(), F2 = new StringBuilder(), F3 = new StringBuilder();
-            public bool WaitL, WaitS, A2, A3;
+            public readonly StringBuilder F1 = new StringBuilder(), F2 = new StringBuilder(), F3 = new StringBuilder(), F4 = new StringBuilder();
+            public bool WaitL, WaitS, A2, A3, A4;                // A2/A3/A4 = F2/F3/F4 armed
             public bool AlarmNow; public DateTime LastAlert = DateTime.MinValue; public int AlertCount;   // any alert
             public readonly List<AlertSlot> Alerts = new List<AlertSlot>();                         // A1..A3 that are set
             public string LogPath;
-            public int Layer { get { return p3.Count > 0 ? 3 : p2.Count > 0 ? 2 : 1; } }
-            public StringBuilder Deepest { get { return p3.Count > 0 ? F3 : p2.Count > 0 ? F2 : F1; } }
+            public int Layer { get { return p4.Count > 0 ? 4 : p3.Count > 0 ? 3 : p2.Count > 0 ? 2 : 1; } }
+            public StringBuilder Deepest { get { return p4.Count > 0 ? F4 : p3.Count > 0 ? F3 : p2.Count > 0 ? F2 : F1; } }
             public string Label
             {
                 get
                 {
                     return "S" + N.ToString("00") + " " + Book + " F1=" + P1
-                         + (p2.Count > 0 ? " F2=" + P2 : "") + (p3.Count > 0 ? " F3=" + P3 : "");
+                         + (p2.Count > 0 ? " F2=" + P2 : "") + (p3.Count > 0 ? " F3=" + P3 : "") + (p4.Count > 0 ? " F4=" + P4 : "");
                 }
             }
             public void Reset()
             {
-                RawL.Clear(); RawS.Clear(); F1.Clear(); F2.Clear(); F3.Clear();
-                WaitL = WaitS = A2 = A3 = false; AlarmNow = false;
+                RawL.Clear(); RawS.Clear(); F1.Clear(); F2.Clear(); F3.Clear(); F4.Clear();
+                WaitL = WaitS = A2 = A3 = A4 = false; AlarmNow = false;
                 foreach (AlertSlot a in Alerts) a.Now = false;
             }
             public string AlertsText()
@@ -168,7 +178,7 @@ namespace NinjaTrader.NinjaScript.Indicators
         }
         private int soundBar = -1;                  // CurrentBar of the last sound (one sound per brick)
 
-        private struct Outcome { public char Side, Bit; public bool InF2, InF3; }
+        private struct Outcome { public char Side, Bit; public bool InF2, InF3, InF4; }
 
         private readonly List<Setup> setups = new List<Setup>();
         private int  prevBit = -1;                  // last brick bit (green=1), for equal-close carry
@@ -204,7 +214,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             if (State == State.SetDefaults)
             {
                 Name        = "Indicator_Renko_MultiRecorder";
-                Description = "Observer: up to 10 Renko transit setups (MERGED/LONG/SHORT, F1/F2/F3) in one indicator, "
+                Description = "Observer: up to 10 Renko transit setups (MERGED/LONG/SHORT, F1/F2/F3/F4) in one indicator, "
                             + "compact HUD, per-setup logs, state file for the browser viewer, last-layer alerts. Does not trade.";
                 Calculate        = Calculate.OnBarClose;
                 IsOverlay        = false;
@@ -215,16 +225,16 @@ namespace NinjaTrader.NinjaScript.Indicators
                 IsSuspendedWhileInactive = false;
                 MaximumBarsLookBack = MaximumBarsLookBack.Infinite;
 
-                Setup1Book = RecorderBookType.MERGED; Setup1F1 = "10"; Setup1F2 = "01,10"; Setup1F3 = ""; Setup1Alert = "1000"; Setup1Alert2 = ""; Setup1Alert3 = "";
-                Setup2Book = RecorderBookType.MERGED; Setup2F1 = "100"; Setup2F2 = "01,10"; Setup2F3 = ""; Setup2Alert = "1000"; Setup2Alert2 = ""; Setup2Alert3 = "";
-                Setup3Book = RecorderBookType.MERGED; Setup3F1 = "1000"; Setup3F2 = "01,10"; Setup3F3 = ""; Setup3Alert = "1000"; Setup3Alert2 = ""; Setup3Alert3 = "";
-                Setup4Book = RecorderBookType.LONG; Setup4F1 = "10"; Setup4F2 = "01,10"; Setup4F3 = ""; Setup4Alert = "1000"; Setup4Alert2 = ""; Setup4Alert3 = "";
-                Setup5Book = RecorderBookType.LONG; Setup5F1 = "100"; Setup5F2 = "01,10"; Setup5F3 = ""; Setup5Alert = "1000"; Setup5Alert2 = ""; Setup5Alert3 = "";
-                Setup6Book = RecorderBookType.LONG; Setup6F1 = "1000"; Setup6F2 = "01,10"; Setup6F3 = ""; Setup6Alert = "1000"; Setup6Alert2 = ""; Setup6Alert3 = "";
-                Setup7Book = RecorderBookType.SHORT; Setup7F1 = "10"; Setup7F2 = "01,10"; Setup7F3 = ""; Setup7Alert = "1000"; Setup7Alert2 = ""; Setup7Alert3 = "";
-                Setup8Book = RecorderBookType.SHORT; Setup8F1 = "100"; Setup8F2 = "01,10"; Setup8F3 = ""; Setup8Alert = "1000"; Setup8Alert2 = ""; Setup8Alert3 = "";
-                Setup9Book = RecorderBookType.SHORT; Setup9F1 = "1000"; Setup9F2 = "01,10"; Setup9F3 = ""; Setup9Alert = "1000"; Setup9Alert2 = ""; Setup9Alert3 = "";
-                Setup10Book = RecorderBookType.MERGED; Setup10F1 = ""; Setup10F2 = ""; Setup10F3 = ""; Setup10Alert = "1000"; Setup10Alert2 = ""; Setup10Alert3 = "";
+                Setup1Book = RecorderBookType.MERGED; Setup1F1 = "10"; Setup1F2 = "01,10"; Setup1F3 = ""; Setup1F4 = ""; Setup1Alert = "1000"; Setup1Alert2 = ""; Setup1Alert3 = "";
+                Setup2Book = RecorderBookType.MERGED; Setup2F1 = "100"; Setup2F2 = "01,10"; Setup2F3 = ""; Setup2F4 = ""; Setup2Alert = "1000"; Setup2Alert2 = ""; Setup2Alert3 = "";
+                Setup3Book = RecorderBookType.MERGED; Setup3F1 = "1000"; Setup3F2 = "01,10"; Setup3F3 = ""; Setup3F4 = ""; Setup3Alert = "1000"; Setup3Alert2 = ""; Setup3Alert3 = "";
+                Setup4Book = RecorderBookType.LONG; Setup4F1 = "10"; Setup4F2 = "01,10"; Setup4F3 = ""; Setup4F4 = ""; Setup4Alert = "1000"; Setup4Alert2 = ""; Setup4Alert3 = "";
+                Setup5Book = RecorderBookType.LONG; Setup5F1 = "100"; Setup5F2 = "01,10"; Setup5F3 = ""; Setup5F4 = ""; Setup5Alert = "1000"; Setup5Alert2 = ""; Setup5Alert3 = "";
+                Setup6Book = RecorderBookType.LONG; Setup6F1 = "1000"; Setup6F2 = "01,10"; Setup6F3 = ""; Setup6F4 = ""; Setup6Alert = "1000"; Setup6Alert2 = ""; Setup6Alert3 = "";
+                Setup7Book = RecorderBookType.SHORT; Setup7F1 = "10"; Setup7F2 = "01,10"; Setup7F3 = ""; Setup7F4 = ""; Setup7Alert = "1000"; Setup7Alert2 = ""; Setup7Alert3 = "";
+                Setup8Book = RecorderBookType.SHORT; Setup8F1 = "100"; Setup8F2 = "01,10"; Setup8F3 = ""; Setup8F4 = ""; Setup8Alert = "1000"; Setup8Alert2 = ""; Setup8Alert3 = "";
+                Setup9Book = RecorderBookType.SHORT; Setup9F1 = "1000"; Setup9F2 = "01,10"; Setup9F3 = ""; Setup9F4 = ""; Setup9Alert = "1000"; Setup9Alert2 = ""; Setup9Alert3 = "";
+                Setup10Book = RecorderBookType.MERGED; Setup10F1 = ""; Setup10F2 = ""; Setup10F3 = ""; Setup10F4 = ""; Setup10Alert = "1000"; Setup10Alert2 = ""; Setup10Alert3 = "";
 
                 IncludeBackFill        = true;
                 BackFillMaxBricks      = 1000;
@@ -281,23 +291,23 @@ namespace NinjaTrader.NinjaScript.Indicators
         private void BuildSetups()
         {
             setups.Clear();
-            AddSlot(1, Setup1Book, Setup1F1, Setup1F2, Setup1F3, Setup1Alert, Setup1Alert2, Setup1Alert3);
-            AddSlot(2, Setup2Book, Setup2F1, Setup2F2, Setup2F3, Setup2Alert, Setup2Alert2, Setup2Alert3);
-            AddSlot(3, Setup3Book, Setup3F1, Setup3F2, Setup3F3, Setup3Alert, Setup3Alert2, Setup3Alert3);
-            AddSlot(4, Setup4Book, Setup4F1, Setup4F2, Setup4F3, Setup4Alert, Setup4Alert2, Setup4Alert3);
-            AddSlot(5, Setup5Book, Setup5F1, Setup5F2, Setup5F3, Setup5Alert, Setup5Alert2, Setup5Alert3);
-            AddSlot(6, Setup6Book, Setup6F1, Setup6F2, Setup6F3, Setup6Alert, Setup6Alert2, Setup6Alert3);
-            AddSlot(7, Setup7Book, Setup7F1, Setup7F2, Setup7F3, Setup7Alert, Setup7Alert2, Setup7Alert3);
-            AddSlot(8, Setup8Book, Setup8F1, Setup8F2, Setup8F3, Setup8Alert, Setup8Alert2, Setup8Alert3);
-            AddSlot(9, Setup9Book, Setup9F1, Setup9F2, Setup9F3, Setup9Alert, Setup9Alert2, Setup9Alert3);
-            AddSlot(10, Setup10Book, Setup10F1, Setup10F2, Setup10F3, Setup10Alert, Setup10Alert2, Setup10Alert3);
+            AddSlot(1, Setup1Book, Setup1F1, Setup1F2, Setup1F3, Setup1F4, Setup1Alert, Setup1Alert2, Setup1Alert3);
+            AddSlot(2, Setup2Book, Setup2F1, Setup2F2, Setup2F3, Setup2F4, Setup2Alert, Setup2Alert2, Setup2Alert3);
+            AddSlot(3, Setup3Book, Setup3F1, Setup3F2, Setup3F3, Setup3F4, Setup3Alert, Setup3Alert2, Setup3Alert3);
+            AddSlot(4, Setup4Book, Setup4F1, Setup4F2, Setup4F3, Setup4F4, Setup4Alert, Setup4Alert2, Setup4Alert3);
+            AddSlot(5, Setup5Book, Setup5F1, Setup5F2, Setup5F3, Setup5F4, Setup5Alert, Setup5Alert2, Setup5Alert3);
+            AddSlot(6, Setup6Book, Setup6F1, Setup6F2, Setup6F3, Setup6F4, Setup6Alert, Setup6Alert2, Setup6Alert3);
+            AddSlot(7, Setup7Book, Setup7F1, Setup7F2, Setup7F3, Setup7F4, Setup7Alert, Setup7Alert2, Setup7Alert3);
+            AddSlot(8, Setup8Book, Setup8F1, Setup8F2, Setup8F3, Setup8F4, Setup8Alert, Setup8Alert2, Setup8Alert3);
+            AddSlot(9, Setup9Book, Setup9F1, Setup9F2, Setup9F3, Setup9F4, Setup9Alert, Setup9Alert2, Setup9Alert3);
+            AddSlot(10, Setup10Book, Setup10F1, Setup10F2, Setup10F3, Setup10F4, Setup10Alert, Setup10Alert2, Setup10Alert3);
             var sb = new StringBuilder();
             sb.AppendLine("Indicator_Renko_MultiRecorder setup check  " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
             foreach (Setup s in setups)
             {
                 string line = s.On
                     ? "Setup " + s.N.ToString("00") + "  ON   " + s.Book + "  F1=[" + string.Join(",", s.p1) + "]  F2=["
-                      + string.Join(",", s.p2) + "]  F3=[" + string.Join(",", s.p3) + "]  alerts: " + s.AlertsText()
+                      + string.Join(",", s.p2) + "]  F3=[" + string.Join(",", s.p3) + "]  F4=[" + string.Join(",", s.p4) + "]  alerts: " + s.AlertsText()
                       + "  -> Layer " + s.Layer + (s.Problem.Length > 0 ? "   NOTE: " + s.Problem : "")
                     : "Setup " + s.N.ToString("00") + "  OFF  " + (s.Problem.Length > 0 ? s.Problem : "(F1 blank)");
                 sb.AppendLine(line);
@@ -312,14 +322,15 @@ namespace NinjaTrader.NinjaScript.Indicators
                 catch { }
         }
 
-        private void AddSlot(int n, RecorderBookType book, string f1, string f2, string f3, string alert, string alert2, string alert3)
+        private void AddSlot(int n, RecorderBookType book, string f1, string f2, string f3, string f4, string alert, string alert2, string alert3)
         {
-            var s = new Setup { N = n, Book = book, P1 = (f1 ?? "").Trim(), P2 = (f2 ?? "").Trim(), P3 = (f3 ?? "").Trim(), PA = (alert ?? "").Trim() };
+            var s = new Setup { N = n, Book = book, P1 = (f1 ?? "").Trim(), P2 = (f2 ?? "").Trim(), P3 = (f3 ?? "").Trim(), P4 = (f4 ?? "").Trim(), PA = (alert ?? "").Trim() };
             string bad;
             if (s.P1.Length == 0) { s.On = false; setups.Add(s); return; }
             if (!ParseChecked(s.P1, s.p1, out bad)) { s.On = false; s.Problem = "F1 '" + s.P1 + "' " + bad + " -> setup OFF"; setups.Add(s); return; }
             if (!ParseChecked(s.P2, s.p2, out bad)) { s.On = false; s.Problem = "F2 '" + s.P2 + "' " + bad + " -> setup OFF"; setups.Add(s); return; }
             if (!ParseChecked(s.P3, s.p3, out bad)) { s.On = false; s.Problem = "F3 '" + s.P3 + "' " + bad + " -> setup OFF"; setups.Add(s); return; }
+            if (!ParseChecked(s.P4, s.p4, out bad)) { s.On = false; s.Problem = "F4 '" + s.P4 + "' " + bad + " -> setup OFF"; setups.Add(s); return; }
             if (!ParseChecked(s.PA, s.pa, out bad)) { s.On = false; s.Problem = "Alert 1 '" + s.PA + "' " + bad + " -> setup OFF"; setups.Add(s); return; }
             string[] ap = { s.PA, (alert2 ?? "").Trim(), (alert3 ?? "").Trim() };
             for (int k = 0; k < 3; k++)
@@ -328,7 +339,11 @@ namespace NinjaTrader.NinjaScript.Indicators
                 if (!ParseChecked(a.P, a.pats, out bad)) { s.On = false; s.Problem = "Alert " + (k + 1) + " '" + a.P + "' " + bad + " -> setup OFF"; setups.Add(s); return; }
                 if (a.pats.Count > 0) s.Alerts.Add(a);
             }
-            if (s.p2.Count == 0 && s.p3.Count > 0) { s.p3.Clear(); s.Problem = "F2 is blank -> F3 ignored (F3 needs F2)"; }
+            // a deeper layer needs the one above it: F2 blank -> F3 and F4 ignored; F3 blank -> F4 ignored
+            if (s.p2.Count == 0 && (s.p3.Count > 0 || s.p4.Count > 0))
+            { s.Problem = "F2 is blank -> " + (s.p3.Count > 0 && s.p4.Count > 0 ? "F3 and F4" : s.p3.Count > 0 ? "F3" : "F4") + " ignored (F3 needs F2, F4 needs F3)"; s.p3.Clear(); s.p4.Clear(); }
+            else if (s.p3.Count == 0 && s.p4.Count > 0)
+            { s.p4.Clear(); s.Problem = "F3 is blank -> F4 ignored (F4 needs F3)"; }
             s.On = true;
             setups.Add(s);
         }
@@ -470,7 +485,13 @@ namespace NinjaTrader.NinjaScript.Indicators
             if (s.p2.Count > 0 && s.A2)
             {
                 o.InF2 = true;
-                if (s.p3.Count > 0 && s.A3) { o.InF3 = true; Append(s.F3, b); }
+                if (s.p3.Count > 0 && s.A3)
+                {
+                    o.InF3 = true;
+                    if (s.p4.Count > 0 && s.A4) { o.InF4 = true; Append(s.F4, b); }
+                    Append(s.F3, b);
+                    s.A4 = s.p4.Count > 0 && MatchAny(s.F3.ToString(), s.p4);
+                }
                 Append(s.F2, b);
                 s.A3 = s.p3.Count > 0 && MatchAny(s.F2.ToString(), s.p3);
             }
@@ -483,7 +504,7 @@ namespace NinjaTrader.NinjaScript.Indicators
         { sb.Append(b); if (sb.Length > MAX_LEN) sb.Remove(0, sb.Length - MAX_LEN); }
 
         private static bool MoneyNext(Setup s)
-        { return s.p2.Count > 0 && s.A2 && (s.p3.Count == 0 || s.A3); }
+        { return s.p2.Count > 0 && s.A2 && (s.p3.Count == 0 || s.A3) && (s.p4.Count == 0 || s.A4); }
 
         // ── reset + log files ────────────────────────────────────────────────
         private void ResetAll(string reason)
@@ -509,13 +530,13 @@ namespace NinjaTrader.NinjaScript.Indicators
             {
                 if (!Directory.Exists(LogFolder)) Directory.CreateDirectory(LogFolder);
                 s.LogPath = Path.Combine(LogFolder, LogBaseName + "_" + ChartTag() + "_S" + s.N.ToString("00") + "_" + s.Book
-                    + "_F1-" + Safe(s.P1) + "_F2-" + Safe(s.p2.Count > 0 ? s.P2 : "") + "_F3-" + Safe(s.p3.Count > 0 ? s.P3 : "")
+                    + "_F1-" + Safe(s.P1) + "_F2-" + Safe(s.p2.Count > 0 ? s.P2 : "") + "_F3-" + Safe(s.p3.Count > 0 ? s.P3 : "") + (s.p4.Count > 0 ? "_F4-" + Safe(s.P4) : "")
                     + "_" + DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss") + ".csv");
                 File.AppendAllText(s.LogPath,
                     "# " + s.Label + "  alerts: " + s.AlertsText() + "  reason=" + reason
                     + "  backfill=" + (IncludeBackFill ? "ON(max " + BackFillMaxBricks + (BackFillCrossSession ? ", cross sessions" : ", this session") + ")" : "OFF")
                     + "  resetOnNewSession=" + ResetOnNewSession + "  rollingWindow=" + RollingWindowBits + Environment.NewLine
-                    + "timestamp,brick_time,replay,side,bit,inF2,inF3,f1_pct,f1_roll,f2_pct,f2_roll,f3_pct,f3_roll,f1,f2,f3,alarm,trail0" + Environment.NewLine);
+                    + "timestamp,brick_time,replay,side,bit,inF2,inF3,f1_pct,f1_roll,f2_pct,f2_roll,f3_pct,f3_roll,f1,f2,f3,alarm,trail0,inF4,f4_pct,f4_roll,f4" + Environment.NewLine);
             }
             catch { s.LogPath = null; }
         }
@@ -536,7 +557,8 @@ namespace NinjaTrader.NinjaScript.Indicators
                 string row = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff", ci) + "," + brickTime.ToString("yyyy-MM-dd HH:mm:ss", ci)
                     + "," + (replay ? "1" : "0") + "," + o.Side + "," + o.Bit + "," + (o.InF2 ? "1" : "0") + "," + (o.InF3 ? "1" : "0")
                     + "," + PctS(s.F1) + "," + RollS(s.F1) + "," + PctS(s.F2) + "," + RollS(s.F2) + "," + PctS(s.F3) + "," + RollS(s.F3)
-                    + "," + s.F1 + "," + s.F2 + "," + s.F3 + ",," + Trail0(s.Deepest);
+                    + "," + s.F1 + "," + s.F2 + "," + s.F3 + ",," + Trail0(s.Deepest)
+                    + "," + (o.InF4 ? "1" : "0") + "," + PctS(s.F4) + "," + RollS(s.F4) + "," + s.F4;
                 File.AppendAllText(s.LogPath, row + Environment.NewLine);
             }
             catch { }
@@ -709,7 +731,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                     sb.Append("{\"n\":").Append(s.N).Append(",\"book\":").Append(J(s.Book.ToString()))
                       .Append(",\"on\":").Append(s.On ? "true" : "false").Append(",\"problem\":").Append(J(s.Problem))
                       .Append(",\"f1\":").Append(J(s.P1)).Append(",\"f2\":").Append(J(s.p2.Count > 0 ? s.P2 : ""))
-                      .Append(",\"f3\":").Append(J(s.p3.Count > 0 ? s.P3 : "")).Append(",\"alert\":").Append(J(s.PA))
+                      .Append(",\"f3\":").Append(J(s.p3.Count > 0 ? s.P3 : "")).Append(",\"f4\":").Append(J(s.p4.Count > 0 ? s.P4 : "")).Append(",\"alert\":").Append(J(s.PA))
                       .Append(",\"layer\":").Append(s.On ? s.Layer : 0)
                       .Append(",\"money_next\":").Append(s.On && MoneyNext(s) ? "true" : "false")
                       .Append(",\"alarm_now\":").Append(s.AlarmNow ? "true" : "false")
@@ -733,6 +755,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                         sb.Append(LineJson("F1", s.P1, s.F1));
                         if (s.p2.Count > 0) sb.Append(",").Append(LineJson("F2", s.P2, s.F2));
                         if (s.p3.Count > 0) sb.Append(",").Append(LineJson("F3", s.P3, s.F3));
+                        if (s.p4.Count > 0) sb.Append(",").Append(LineJson("F4", s.P4, s.F4));
                     }
                     sb.Append("]}");
                 }
@@ -1014,150 +1037,170 @@ namespace NinjaTrader.NinjaScript.Indicators
         public RecorderBookType Setup1Book { get; set; }
         [Display(Name="F1 Pattern (blank = setup OFF)", Order=2, GroupName="Setup 01")]
         public string Setup1F1 { get; set; }
-        [Display(Name="F2 Pattern (leave blank to skip F2 and F3)", Order=3, GroupName="Setup 01")]
+        [Display(Name="F2 Pattern (leave blank to skip F2, F3 and F4)", Order=3, GroupName="Setup 01")]
         public string Setup1F2 { get; set; }
-        [Display(Name="F3 Pattern (leave blank to skip; needs F2)", Order=4, GroupName="Setup 01")]
+        [Display(Name="F3 Pattern (leave blank to skip F3 and F4; needs F2)", Order=4, GroupName="Setup 01")]
         public string Setup1F3 { get; set; }
-        [Display(Name="Alert 1 - last layer pattern (blank = none)", Order=5, GroupName="Setup 01")]
+        [Display(Name="F4 Pattern (leave blank to skip; needs F3)", Order=5, GroupName="Setup 01")]
+        public string Setup1F4 { get; set; }
+        [Display(Name="Alert 1 - last layer pattern (blank = none)", Order=6, GroupName="Setup 01")]
         public string Setup1Alert { get; set; }
-        [Display(Name="Alert 2 - last layer pattern (blank = none)", Order=6, GroupName="Setup 01")]
+        [Display(Name="Alert 2 - last layer pattern (blank = none)", Order=7, GroupName="Setup 01")]
         public string Setup1Alert2 { get; set; }
-        [Display(Name="Alert 3 - last layer pattern (blank = none)", Order=7, GroupName="Setup 01")]
+        [Display(Name="Alert 3 - last layer pattern (blank = none)", Order=8, GroupName="Setup 01")]
         public string Setup1Alert3 { get; set; }
 
         [Display(Name="Book", Order=1, GroupName="Setup 02")]
         public RecorderBookType Setup2Book { get; set; }
         [Display(Name="F1 Pattern (blank = setup OFF)", Order=2, GroupName="Setup 02")]
         public string Setup2F1 { get; set; }
-        [Display(Name="F2 Pattern (leave blank to skip F2 and F3)", Order=3, GroupName="Setup 02")]
+        [Display(Name="F2 Pattern (leave blank to skip F2, F3 and F4)", Order=3, GroupName="Setup 02")]
         public string Setup2F2 { get; set; }
-        [Display(Name="F3 Pattern (leave blank to skip; needs F2)", Order=4, GroupName="Setup 02")]
+        [Display(Name="F3 Pattern (leave blank to skip F3 and F4; needs F2)", Order=4, GroupName="Setup 02")]
         public string Setup2F3 { get; set; }
-        [Display(Name="Alert 1 - last layer pattern (blank = none)", Order=5, GroupName="Setup 02")]
+        [Display(Name="F4 Pattern (leave blank to skip; needs F3)", Order=5, GroupName="Setup 02")]
+        public string Setup2F4 { get; set; }
+        [Display(Name="Alert 1 - last layer pattern (blank = none)", Order=6, GroupName="Setup 02")]
         public string Setup2Alert { get; set; }
-        [Display(Name="Alert 2 - last layer pattern (blank = none)", Order=6, GroupName="Setup 02")]
+        [Display(Name="Alert 2 - last layer pattern (blank = none)", Order=7, GroupName="Setup 02")]
         public string Setup2Alert2 { get; set; }
-        [Display(Name="Alert 3 - last layer pattern (blank = none)", Order=7, GroupName="Setup 02")]
+        [Display(Name="Alert 3 - last layer pattern (blank = none)", Order=8, GroupName="Setup 02")]
         public string Setup2Alert3 { get; set; }
 
         [Display(Name="Book", Order=1, GroupName="Setup 03")]
         public RecorderBookType Setup3Book { get; set; }
         [Display(Name="F1 Pattern (blank = setup OFF)", Order=2, GroupName="Setup 03")]
         public string Setup3F1 { get; set; }
-        [Display(Name="F2 Pattern (leave blank to skip F2 and F3)", Order=3, GroupName="Setup 03")]
+        [Display(Name="F2 Pattern (leave blank to skip F2, F3 and F4)", Order=3, GroupName="Setup 03")]
         public string Setup3F2 { get; set; }
-        [Display(Name="F3 Pattern (leave blank to skip; needs F2)", Order=4, GroupName="Setup 03")]
+        [Display(Name="F3 Pattern (leave blank to skip F3 and F4; needs F2)", Order=4, GroupName="Setup 03")]
         public string Setup3F3 { get; set; }
-        [Display(Name="Alert 1 - last layer pattern (blank = none)", Order=5, GroupName="Setup 03")]
+        [Display(Name="F4 Pattern (leave blank to skip; needs F3)", Order=5, GroupName="Setup 03")]
+        public string Setup3F4 { get; set; }
+        [Display(Name="Alert 1 - last layer pattern (blank = none)", Order=6, GroupName="Setup 03")]
         public string Setup3Alert { get; set; }
-        [Display(Name="Alert 2 - last layer pattern (blank = none)", Order=6, GroupName="Setup 03")]
+        [Display(Name="Alert 2 - last layer pattern (blank = none)", Order=7, GroupName="Setup 03")]
         public string Setup3Alert2 { get; set; }
-        [Display(Name="Alert 3 - last layer pattern (blank = none)", Order=7, GroupName="Setup 03")]
+        [Display(Name="Alert 3 - last layer pattern (blank = none)", Order=8, GroupName="Setup 03")]
         public string Setup3Alert3 { get; set; }
 
         [Display(Name="Book", Order=1, GroupName="Setup 04")]
         public RecorderBookType Setup4Book { get; set; }
         [Display(Name="F1 Pattern (blank = setup OFF)", Order=2, GroupName="Setup 04")]
         public string Setup4F1 { get; set; }
-        [Display(Name="F2 Pattern (leave blank to skip F2 and F3)", Order=3, GroupName="Setup 04")]
+        [Display(Name="F2 Pattern (leave blank to skip F2, F3 and F4)", Order=3, GroupName="Setup 04")]
         public string Setup4F2 { get; set; }
-        [Display(Name="F3 Pattern (leave blank to skip; needs F2)", Order=4, GroupName="Setup 04")]
+        [Display(Name="F3 Pattern (leave blank to skip F3 and F4; needs F2)", Order=4, GroupName="Setup 04")]
         public string Setup4F3 { get; set; }
-        [Display(Name="Alert 1 - last layer pattern (blank = none)", Order=5, GroupName="Setup 04")]
+        [Display(Name="F4 Pattern (leave blank to skip; needs F3)", Order=5, GroupName="Setup 04")]
+        public string Setup4F4 { get; set; }
+        [Display(Name="Alert 1 - last layer pattern (blank = none)", Order=6, GroupName="Setup 04")]
         public string Setup4Alert { get; set; }
-        [Display(Name="Alert 2 - last layer pattern (blank = none)", Order=6, GroupName="Setup 04")]
+        [Display(Name="Alert 2 - last layer pattern (blank = none)", Order=7, GroupName="Setup 04")]
         public string Setup4Alert2 { get; set; }
-        [Display(Name="Alert 3 - last layer pattern (blank = none)", Order=7, GroupName="Setup 04")]
+        [Display(Name="Alert 3 - last layer pattern (blank = none)", Order=8, GroupName="Setup 04")]
         public string Setup4Alert3 { get; set; }
 
         [Display(Name="Book", Order=1, GroupName="Setup 05")]
         public RecorderBookType Setup5Book { get; set; }
         [Display(Name="F1 Pattern (blank = setup OFF)", Order=2, GroupName="Setup 05")]
         public string Setup5F1 { get; set; }
-        [Display(Name="F2 Pattern (leave blank to skip F2 and F3)", Order=3, GroupName="Setup 05")]
+        [Display(Name="F2 Pattern (leave blank to skip F2, F3 and F4)", Order=3, GroupName="Setup 05")]
         public string Setup5F2 { get; set; }
-        [Display(Name="F3 Pattern (leave blank to skip; needs F2)", Order=4, GroupName="Setup 05")]
+        [Display(Name="F3 Pattern (leave blank to skip F3 and F4; needs F2)", Order=4, GroupName="Setup 05")]
         public string Setup5F3 { get; set; }
-        [Display(Name="Alert 1 - last layer pattern (blank = none)", Order=5, GroupName="Setup 05")]
+        [Display(Name="F4 Pattern (leave blank to skip; needs F3)", Order=5, GroupName="Setup 05")]
+        public string Setup5F4 { get; set; }
+        [Display(Name="Alert 1 - last layer pattern (blank = none)", Order=6, GroupName="Setup 05")]
         public string Setup5Alert { get; set; }
-        [Display(Name="Alert 2 - last layer pattern (blank = none)", Order=6, GroupName="Setup 05")]
+        [Display(Name="Alert 2 - last layer pattern (blank = none)", Order=7, GroupName="Setup 05")]
         public string Setup5Alert2 { get; set; }
-        [Display(Name="Alert 3 - last layer pattern (blank = none)", Order=7, GroupName="Setup 05")]
+        [Display(Name="Alert 3 - last layer pattern (blank = none)", Order=8, GroupName="Setup 05")]
         public string Setup5Alert3 { get; set; }
 
         [Display(Name="Book", Order=1, GroupName="Setup 06")]
         public RecorderBookType Setup6Book { get; set; }
         [Display(Name="F1 Pattern (blank = setup OFF)", Order=2, GroupName="Setup 06")]
         public string Setup6F1 { get; set; }
-        [Display(Name="F2 Pattern (leave blank to skip F2 and F3)", Order=3, GroupName="Setup 06")]
+        [Display(Name="F2 Pattern (leave blank to skip F2, F3 and F4)", Order=3, GroupName="Setup 06")]
         public string Setup6F2 { get; set; }
-        [Display(Name="F3 Pattern (leave blank to skip; needs F2)", Order=4, GroupName="Setup 06")]
+        [Display(Name="F3 Pattern (leave blank to skip F3 and F4; needs F2)", Order=4, GroupName="Setup 06")]
         public string Setup6F3 { get; set; }
-        [Display(Name="Alert 1 - last layer pattern (blank = none)", Order=5, GroupName="Setup 06")]
+        [Display(Name="F4 Pattern (leave blank to skip; needs F3)", Order=5, GroupName="Setup 06")]
+        public string Setup6F4 { get; set; }
+        [Display(Name="Alert 1 - last layer pattern (blank = none)", Order=6, GroupName="Setup 06")]
         public string Setup6Alert { get; set; }
-        [Display(Name="Alert 2 - last layer pattern (blank = none)", Order=6, GroupName="Setup 06")]
+        [Display(Name="Alert 2 - last layer pattern (blank = none)", Order=7, GroupName="Setup 06")]
         public string Setup6Alert2 { get; set; }
-        [Display(Name="Alert 3 - last layer pattern (blank = none)", Order=7, GroupName="Setup 06")]
+        [Display(Name="Alert 3 - last layer pattern (blank = none)", Order=8, GroupName="Setup 06")]
         public string Setup6Alert3 { get; set; }
 
         [Display(Name="Book", Order=1, GroupName="Setup 07")]
         public RecorderBookType Setup7Book { get; set; }
         [Display(Name="F1 Pattern (blank = setup OFF)", Order=2, GroupName="Setup 07")]
         public string Setup7F1 { get; set; }
-        [Display(Name="F2 Pattern (leave blank to skip F2 and F3)", Order=3, GroupName="Setup 07")]
+        [Display(Name="F2 Pattern (leave blank to skip F2, F3 and F4)", Order=3, GroupName="Setup 07")]
         public string Setup7F2 { get; set; }
-        [Display(Name="F3 Pattern (leave blank to skip; needs F2)", Order=4, GroupName="Setup 07")]
+        [Display(Name="F3 Pattern (leave blank to skip F3 and F4; needs F2)", Order=4, GroupName="Setup 07")]
         public string Setup7F3 { get; set; }
-        [Display(Name="Alert 1 - last layer pattern (blank = none)", Order=5, GroupName="Setup 07")]
+        [Display(Name="F4 Pattern (leave blank to skip; needs F3)", Order=5, GroupName="Setup 07")]
+        public string Setup7F4 { get; set; }
+        [Display(Name="Alert 1 - last layer pattern (blank = none)", Order=6, GroupName="Setup 07")]
         public string Setup7Alert { get; set; }
-        [Display(Name="Alert 2 - last layer pattern (blank = none)", Order=6, GroupName="Setup 07")]
+        [Display(Name="Alert 2 - last layer pattern (blank = none)", Order=7, GroupName="Setup 07")]
         public string Setup7Alert2 { get; set; }
-        [Display(Name="Alert 3 - last layer pattern (blank = none)", Order=7, GroupName="Setup 07")]
+        [Display(Name="Alert 3 - last layer pattern (blank = none)", Order=8, GroupName="Setup 07")]
         public string Setup7Alert3 { get; set; }
 
         [Display(Name="Book", Order=1, GroupName="Setup 08")]
         public RecorderBookType Setup8Book { get; set; }
         [Display(Name="F1 Pattern (blank = setup OFF)", Order=2, GroupName="Setup 08")]
         public string Setup8F1 { get; set; }
-        [Display(Name="F2 Pattern (leave blank to skip F2 and F3)", Order=3, GroupName="Setup 08")]
+        [Display(Name="F2 Pattern (leave blank to skip F2, F3 and F4)", Order=3, GroupName="Setup 08")]
         public string Setup8F2 { get; set; }
-        [Display(Name="F3 Pattern (leave blank to skip; needs F2)", Order=4, GroupName="Setup 08")]
+        [Display(Name="F3 Pattern (leave blank to skip F3 and F4; needs F2)", Order=4, GroupName="Setup 08")]
         public string Setup8F3 { get; set; }
-        [Display(Name="Alert 1 - last layer pattern (blank = none)", Order=5, GroupName="Setup 08")]
+        [Display(Name="F4 Pattern (leave blank to skip; needs F3)", Order=5, GroupName="Setup 08")]
+        public string Setup8F4 { get; set; }
+        [Display(Name="Alert 1 - last layer pattern (blank = none)", Order=6, GroupName="Setup 08")]
         public string Setup8Alert { get; set; }
-        [Display(Name="Alert 2 - last layer pattern (blank = none)", Order=6, GroupName="Setup 08")]
+        [Display(Name="Alert 2 - last layer pattern (blank = none)", Order=7, GroupName="Setup 08")]
         public string Setup8Alert2 { get; set; }
-        [Display(Name="Alert 3 - last layer pattern (blank = none)", Order=7, GroupName="Setup 08")]
+        [Display(Name="Alert 3 - last layer pattern (blank = none)", Order=8, GroupName="Setup 08")]
         public string Setup8Alert3 { get; set; }
 
         [Display(Name="Book", Order=1, GroupName="Setup 09")]
         public RecorderBookType Setup9Book { get; set; }
         [Display(Name="F1 Pattern (blank = setup OFF)", Order=2, GroupName="Setup 09")]
         public string Setup9F1 { get; set; }
-        [Display(Name="F2 Pattern (leave blank to skip F2 and F3)", Order=3, GroupName="Setup 09")]
+        [Display(Name="F2 Pattern (leave blank to skip F2, F3 and F4)", Order=3, GroupName="Setup 09")]
         public string Setup9F2 { get; set; }
-        [Display(Name="F3 Pattern (leave blank to skip; needs F2)", Order=4, GroupName="Setup 09")]
+        [Display(Name="F3 Pattern (leave blank to skip F3 and F4; needs F2)", Order=4, GroupName="Setup 09")]
         public string Setup9F3 { get; set; }
-        [Display(Name="Alert 1 - last layer pattern (blank = none)", Order=5, GroupName="Setup 09")]
+        [Display(Name="F4 Pattern (leave blank to skip; needs F3)", Order=5, GroupName="Setup 09")]
+        public string Setup9F4 { get; set; }
+        [Display(Name="Alert 1 - last layer pattern (blank = none)", Order=6, GroupName="Setup 09")]
         public string Setup9Alert { get; set; }
-        [Display(Name="Alert 2 - last layer pattern (blank = none)", Order=6, GroupName="Setup 09")]
+        [Display(Name="Alert 2 - last layer pattern (blank = none)", Order=7, GroupName="Setup 09")]
         public string Setup9Alert2 { get; set; }
-        [Display(Name="Alert 3 - last layer pattern (blank = none)", Order=7, GroupName="Setup 09")]
+        [Display(Name="Alert 3 - last layer pattern (blank = none)", Order=8, GroupName="Setup 09")]
         public string Setup9Alert3 { get; set; }
 
         [Display(Name="Book", Order=1, GroupName="Setup 10")]
         public RecorderBookType Setup10Book { get; set; }
         [Display(Name="F1 Pattern (blank = setup OFF)", Order=2, GroupName="Setup 10")]
         public string Setup10F1 { get; set; }
-        [Display(Name="F2 Pattern (leave blank to skip F2 and F3)", Order=3, GroupName="Setup 10")]
+        [Display(Name="F2 Pattern (leave blank to skip F2, F3 and F4)", Order=3, GroupName="Setup 10")]
         public string Setup10F2 { get; set; }
-        [Display(Name="F3 Pattern (leave blank to skip; needs F2)", Order=4, GroupName="Setup 10")]
+        [Display(Name="F3 Pattern (leave blank to skip F3 and F4; needs F2)", Order=4, GroupName="Setup 10")]
         public string Setup10F3 { get; set; }
-        [Display(Name="Alert 1 - last layer pattern (blank = none)", Order=5, GroupName="Setup 10")]
+        [Display(Name="F4 Pattern (leave blank to skip; needs F3)", Order=5, GroupName="Setup 10")]
+        public string Setup10F4 { get; set; }
+        [Display(Name="Alert 1 - last layer pattern (blank = none)", Order=6, GroupName="Setup 10")]
         public string Setup10Alert { get; set; }
-        [Display(Name="Alert 2 - last layer pattern (blank = none)", Order=6, GroupName="Setup 10")]
+        [Display(Name="Alert 2 - last layer pattern (blank = none)", Order=7, GroupName="Setup 10")]
         public string Setup10Alert2 { get; set; }
-        [Display(Name="Alert 3 - last layer pattern (blank = none)", Order=7, GroupName="Setup 10")]
+        [Display(Name="Alert 3 - last layer pattern (blank = none)", Order=8, GroupName="Setup 10")]
         public string Setup10Alert3 { get; set; }
 
         [Display(Name="Include back fill (replay stored bricks on enable)", Order=1, GroupName="Common 1. History")]
