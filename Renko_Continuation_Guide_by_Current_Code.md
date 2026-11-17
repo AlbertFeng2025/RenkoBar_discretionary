@@ -1,8 +1,8 @@
 # Renko Continuation Guide — by Current Code
 *Continuation trading with the existing Renko **Transit** strategy code (no new code)*
 **Instrument in the examples:** MNQ (Micro Nasdaq, $2 per point) · **Chart:** Renko 40 ticks (1 brick = 10 points)
-**Code:** `Scalper_Renko_TransitLONGrepeat_Layer2/3.cs`, `Scalper_Renko_TransitSHORTrepeat_Layer2/3.cs`, `Renko_mergedTransit_Layer2/layer3.cs`
-**Date:** 2026-11-01
+**Code:** `Scalper_Renko_TransitLONGrepeat_Layer2/3/4.cs`, `Scalper_Renko_TransitSHORTrepeat_Layer2/3/4.cs`, `Renko_mergedTransit_Layer2/layer3/layer4.cs`
+**Date:** 2026-11-01 · **Updated:** 2026-11-17 (Layer 4 files, section 11; fast-market fills from live tests, section 12)
 
 ---
 
@@ -107,11 +107,12 @@ On another brick size, scale it (80-tick = 20 pt brick → Stop 40, Target 20). 
 
 | Setting | Value | Note |
 |---|---|---|
-| File | `Scalper_Renko_TransitLONGrepeat_Layer3` with **F3 blank** (= Layer 2), or the Layer 2 file | merged Layer 3 also treats F3 blank as Layer 2 (version of 2026-10-28) |
+| File | `Scalper_Renko_TransitLONGrepeat_Layer3` with **F3 blank** (= Layer 2), the Layer 2 file, or the **Layer 4** file with F3 and F4 blank | merged Layer 3 and Layer 4 also treat F3 blank as Layer 2; Layer 4 files: see section 11 |
 | Enable Real Order | **off** for the first runs | watch the logs first |
 | F1 Pattern | `01` (or `001`, `0001` …) | **must end in 1** |
 | F2 Pattern | `01,10` | filter on the F1 outcome string |
 | F3 Pattern | blank | Layer 2 behaviour |
+| F4 Pattern (Layer 4 files only) | blank | ignored anyway while F3 is blank |
 | Stop loss (points) | **20** | 2 bricks |
 | Profit target (points) | **10** | 1 brick |
 | Use market entry | on | entry at the brick close; the bracket is anchored to the brick close |
@@ -134,6 +135,7 @@ Book **LONG**, F1 `01`, F2 `01,10`, F3 blank — on the **same chart**.
 | **rawString** | every brick | LONG book: 1 = green, 0 = red (SHORT book: 1 = red) | the **F1** pattern |
 | **F1 outcome** (`filter1Outcome`) | the next brick after **every** F1 signal | 1 = that brick went your way (would-be win) | the **F2** pattern |
 | **Filtered (theory) string** — F2 outcome (`filter2Outcome`); in the viewer the last line, "F2 = money" | the next brick after every signal **taken while F2 was armed** | would-be win / loss of the trades the filter allows | the **F3** pattern (if used) |
+| **F3 outcome** (`filter3Outcome`) — Layer 4 files with F4 set | the next brick after every signal taken while F2 **and** F3 were armed | would-be win / loss of the Layer 3 trades | the **F4** pattern |
 | **Real money string** (`realTradeOutcome`; today's part = `sessionRealOutcome`) | **actual filled trades** | 1 = more contracts filled at the target than at the stop | the **qty rule**, the **exit pattern** (today's part) and the **breaker** (losses in a row) |
 
 * **The filter (F1, F2, F3) decides WHEN to trade** — it is theoretical, made of would-be trades.
@@ -150,7 +152,13 @@ read (and, when F3 is set, to arm F3).
 |---|---|---|
 | F1 outcome (theory, Layer 1) | yes — `f1out=` | yes — column `filter1Outcome` |
 | Last-layer outcome (theory, F2) | **yes** — `f2out=` | **only Layer 3 with F3 set** (`filter2Outcome`); Layer 2, or Layer 3 with F3 blank: **no** (column missing or empty) |
+| Layer 3 outcome (theory, F3) — Layer 4 files | **only with F4 set** — `f3out=` | **only with F4 set** — column `filter3Outcome` (the last column) |
 | Real money trades — **used by the qty rule, exit pattern, breaker** | yes — `real=` on each `TRADE CLOSED`, `[QTY] sessionReal=` | yes — column `realTradeOutcome` |
+
+**Log files.** The **merged** strategy writes **one** file: its log *is* the diagnostic log (every brick,
+signal, `[F2 MATCH]`, `MONEY TRADE`, `TRADE CLOSED` …). There is no separate `-diagLog` file for merged —
+that is by design. **LONG / SHORT** write **two** files: the trade CSV (one row per brick, columns
+above) and `<name>-diagLog.csv` with the step-by-step lines.
 
 So to check your qty rule or exit, always look at the real money string: the `realTradeOutcome`
 column in LONG/SHORT, the `real=` lines in merged.
@@ -300,7 +308,8 @@ They differ when:
    trade's qty would be ×1 instead of ×3.
 2. **Fills:** the target is touched but not filled and the trade later loses (theory **1**, real **0**);
    with several contracts, more of them stopped out than filled at the target (majority rule → real
-   **0**). Stop slippage costs money but does not change the bit.
+   **0**). Stop slippage costs money but does not change the bit. **Entry slippage** does not change
+   the bit either, but it changes how much the win or loss is worth — see section 12.
 3. **Stop / target do not match the brick geometry** (section 2).
 4. **Different start:** the viewer includes history from before the strategy was enabled; the real
    string starts at enable (today's part resets each new day). Compare only the newest bits.
@@ -334,6 +343,7 @@ The strategy log tells you why: `[OUTSIDE HOURS]`, `skipped (busy)`, `[QTY SKIP]
 - [ ] Exit pattern and breaker chosen on purpose; breaker small.
 - [ ] Real orders **off** first; the log shows signals, `[F2 MATCH]` / `[F2 NO MATCH]`, and would-be results as expected.
 - [ ] Sim101 run on a normal and a fast day; every `TRADE CLOSED` line checked (winQty / lossQty, slippage).
+- [ ] Entry price on each `TRADE CLOSED` compared with `brickClose` on its `MONEY TRADE` line (section 12) — continuation's 1-brick target is very sensitive to a late entry.
 - [ ] The recorder / viewer watches the same setup on the **same chart**; new unique Log Base Name; the LIVE header shows that name.
 - [ ] You can explain every row of the table in section 5 without looking. If not, re-read before trading real money.
 
@@ -393,3 +403,110 @@ For SHORT the bracket is mirrored: stop **above** the entry (+20 pt), target **b
 
 The string `110` mixes SHORT, LONG and SHORT results. A qty rule or exit pattern does not know or care
 which direction each bit came from — only win or loss.
+
+---
+
+## 11. Layer 4 files
+
+**Files:** `Renko_mergedTransit_layer4.cs`, `Scalper_Renko_TransitLONGrepeat_Layer4.cs`,
+`Scalper_Renko_TransitSHORTrepeat_Layer4.cs` (and the recorder indicator v1.6 + viewer, which show F4).
+The order, stop/target and safety code is the same as Layer 3 — only one more filter layer was added.
+
+### The idea — one more layer, same rule
+| Layer | Pattern | Is matched on | When it matches |
+|---|---|---|---|
+| 1 | F1 | the brick string | the next brick is scored → **F1 outcome** |
+| 2 | F2 | the F1 outcome string | F2 **armed**: the next F1 outcome is copied into the **F2 outcome** string |
+| 3 | F3 | the F2 outcome string | F3 **armed**: the next F2 outcome is copied into the **F3 outcome** string |
+| **4** | **F4** | **the F3 outcome string** | F4 **armed** |
+
+**Money trade** = an F1 signal while F2 **and** F3 **and** F4 are armed. While F4 is not armed, a signal with
+F2 and F3 armed is only watched — the log says `L3 obs only (F4 not armed)` — and its result goes into
+the F3 outcome string.
+
+* **F4 stays armed until the next F3 outcome arrives**, even if F2 or F3 switch off and on again in the
+  meantime (the same rule as F3 staying armed while F2 is off). Live example (merged, Nov 16): F4 armed at
+  10:50, F3 switched off and back on, and the money trade came at 11:25.
+* **Each layer makes trades rarer.** In continuation the 1's rate is about 67 %, so an F4 built from 0's
+  (Layer 3 *losses*) arms seldom. Live example (SHORT, F1 `001`, F2 `01,10`, F3 `10`, F4 `0`, Nov 16–17):
+  F2 and F3 were armed together only once overnight; that Layer 3 signal **won**, so F4 = `0` never armed
+  and no trade happened — correct, just rare.
+* A deeper layer is **not** an edge by itself (section 8): it only decides *which* of the same signals you take.
+
+### One Layer 4 file can run Layer 4, 3 or 2 — but not Layer 1
+| Settings in a Layer 4 file | Behaves as | Start-up message |
+|---|---|---|
+| F1, F2, F3, F4 set | **Layer 4** | ready line shows `F4=[…]` |
+| F4 blank | **Layer 3** — identical to the Layer 3 file (checked bit for bit) | `[F4] active=[] (blank -> Layer-3 behaviour)` |
+| F3 blank | **Layer 2** — F4 is ignored even if typed | `[F3] active=[] (blank -> Layer-2 behaviour)` and `[F4] … (F3 blank -> F4 not used)`, or `[F4] IGNORED …` if F4 was typed |
+| F2 blank | **never trades** — this is **not** Layer 1 | — |
+
+The ready line (`… F2=[…], F3=[…], F4=[…] …`) is in every log. The `[F3] active` / `[F4] active` lines are at
+the top of the merged log; LONG/SHORT print them in the NinjaScript Output window.
+
+So you can keep one Layer 4 file for Layer 2, 3 and 4 work and choose the layer by leaving patterns blank.
+**For Layer 1 trading use the Layer 1 file** — in every strategy file a blank F2 means no money trades.
+(The recorder indicator is different: there F2 blank = Layer 1, see the indicator guide.)
+
+### What the logs show for Layer 4
+* Merged: `f3out=` on every `[OUT]` line and in the seed state line, plus `[F4 MATCH] armed4=true` /
+  `[F4] armed4=false`.
+* LONG / SHORT: one extra **last** column `filter3Outcome` in the trade CSV; the diagLog shows
+  `[F3 COLLECT] f3=… -> [F4 MATCH]` / `[F4 NO MATCH]` and `isArmed4=` on each `[PIPELINE]` line.
+* Recorder CSV: four columns added at the **end** (`inF4, f4_pct, f4_roll, f4`); the file name gets
+  `_F4-…` only when F4 is set. Old columns keep their place.
+
+**Checked (Nov 16–17 live/Sim logs):** every F1/F2/F3 string and every money decision replayed brick by
+brick — merged 976 bricks and 12 money trades, SHORT 148 bricks — with no difference from the rules above.
+
+---
+
+## 12. Fast markets — what the live tests showed (Nov 17, 2026)
+
+Five merged test trades on MNQ 40-tick (transit bracket stop 10 / target 20) were checked fill by fill.
+**The code had no error**; the money lost against a perfect fill came from the market speed.
+
+### How the bracket is placed
+* Entry is a **market** order sent right after the signal brick closes.
+* Stop and target are measured from the **brick close** (`brickClose` on the `MONEY TRADE` line),
+  **not** from your fill price.
+* The **target is a limit** order: it fills at its price (or slightly better only if price jumps over it).
+  The **stop is a stop-market** order: it fills at whatever price is there, so it can slip.
+
+### What happened
+| | Effect (points × contracts) |
+|---|---|
+| Entry slippage, 5 trades | **−1,548** — two trades in very fast bursts cost −770 (5.75 pt late × 154) and −528 (6 pt late × 88) |
+| Exit slippage, 5 trades | **+173** — targets sometimes filled past their price |
+| Total vs. perfect fills | **−1,375** (about −$2,750 on MNQ) |
+
+**Why a fast move did not give more profit:** the move happened *while the order was being filled*, so the
+entry was late; after that the target stays at brick close ± target, and a limit target pays only its own
+price. In a fast market entries and stops can slip against you, but a fixed target almost never pays more.
+
+### Why this matters even more for continuation
+Continuation has the **small** target (1 brick) and the **big** stop (2 bricks). A late entry in your
+direction eats into the small side. MNQ 40-tick LONG, brick close P = 25000, filled 4 points late at 25004:
+
+| | Planned | With the late fill |
+|---|---|---|
+| Target 25010 | +10 | **+6** |
+| Stop 24980 | −20 | **−24** |
+| Win rate needed to break even | 66.7 % | **80 %** |
+
+A very late fill can eat almost the whole 10-point target. The win/loss **bit** is still decided by the
+next brick, so the strings look normal while the money does not — compare `brickClose` with the entry
+price on `TRADE CLOSED` to see it.
+
+### Other things seen in the logs (all normal)
+* **Time from brick close to order sent:** usually 0.1–0.2 s, but 1.2 s and 4.2 s were seen. That time is
+  spent inside NinjaTrader placing the order, not in the strategy's decision. It was **not** the main
+  cause: a 0.2 s trade still slipped 5.75 points, and the 4.2 s trade filled 1.25 points *better*.
+  If long gaps happen often, check the connection and the PC's load.
+* **`[RECONCILE] flat & idle but stray order(s) live -> canceling, skipping entry this brick`** — a safety
+  check after a stop filled during a burst of 3 bricks in 0.1 s; it cancelled a leftover order. That
+  brick had no signal, so nothing was missed.
+* **Larger size makes slippage cost more** — it is paid per contract, so a qty rule that raises size
+  after losses also raises the cost of each late fill.
+* Fast bursts are where most of the damage happens; slower markets gave fills at or near the brick close.
+
